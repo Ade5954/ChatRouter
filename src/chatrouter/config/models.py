@@ -223,6 +223,39 @@ class FeedbackConfig(BaseModel):
     treat_truncation_as_negative: bool = True
 
 
+class ContextOverflowStrategy(str, Enum):
+    """What to do when the prompt exceeds every candidate's context window."""
+
+    # Fail fast with 400. Safest: the client learns the truth.
+    REJECT = "reject"
+    # Route to the largest-window model even if its tier is a poor match.
+    LARGEST_WINDOW = "largest_window"
+    # Drop middle history to make the prompt fit. Lossy, so it is opt-in.
+    TRIM_HISTORY = "trim_history"
+
+
+class ContextOverflowConfig(BaseModel):
+    """Handling for prompts that no candidate model can accommodate.
+
+    Without this the gateway hard-fails, because the capability filter simply
+    drops every model whose window is too small and routing then finds no
+    candidate. In production a long conversation is a normal occurrence, not an
+    error, so there needs to be a defined degradation path.
+    """
+
+    strategy: ContextOverflowStrategy = ContextOverflowStrategy.LARGEST_WINDOW
+    # Fraction of the window the prompt may occupy after trimming, leaving
+    # room for the completion.
+    trim_target_ratio: float = Field(default=0.7, gt=0.0, le=1.0)
+    # Leading messages that must survive trimming (system prompt, task setup).
+    keep_leading_messages: int = Field(default=1, ge=0)
+    # Trailing messages that must survive: the actual question plus context.
+    keep_trailing_messages: int = Field(default=4, ge=1)
+    # Insert a marker where content was removed so the model is not misled
+    # into thinking the conversation was contiguous.
+    insert_elision_notice: bool = True
+
+
 class RoutingConfig(BaseModel):
     """Top-level routing policy."""
 
@@ -241,6 +274,7 @@ class RoutingConfig(BaseModel):
     auto_model_aliases: list[str] = Field(default_factory=lambda: ["auto", "chatrouter-auto"])
     thresholds: TierThresholds = Field(default_factory=TierThresholds)
     context: ContextRoutingConfig = Field(default_factory=ContextRoutingConfig)
+    context_overflow: ContextOverflowConfig = Field(default_factory=ContextOverflowConfig)
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
 
 

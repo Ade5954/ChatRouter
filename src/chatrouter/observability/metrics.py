@@ -128,6 +128,12 @@ QUOTA_EVENTS = _counter(
     ["tenant", "action"],
 )
 
+CONTEXT_TRIMMED = _counter(
+    "chatrouter_context_trimmed_total",
+    "Conversations whose history was trimmed to fit the context window.",
+    ["model"],
+)
+
 OVERFLOW_EVENTS = _counter(
     "chatrouter_overflow_total",
     "Requests rescheduled because the preferred model was saturated.",

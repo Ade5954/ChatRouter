@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -342,6 +343,56 @@ class TestFeedbackEndpoint:
         )
         assert response.status_code == 200
         assert response.json()["accepted"] is False
+
+    def test_feedback_cannot_be_replayed(self, client):
+        """A request_id must be scoreable exactly once.
+
+        request_id is returned to the client in a response header, so a
+        replayable feedback endpoint is a poisoning vector for adaptive
+        routing: repeated downvotes would drive a model out of the pool.
+        """
+        with respx.mock:
+            respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
+            completion = client.post(
+                "/v1/chat/completions",
+                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                headers=AUTH,
+            )
+        request_id = completion.headers["x-chatrouter-request-id"]
+
+        first = client.post(
+            "/v1/feedback", json={"request_id": request_id, "thumb": "down"}, headers=AUTH
+        )
+        assert first.json()["accepted"] is True
+
+        for _ in range(5):
+            replay = client.post(
+                "/v1/feedback", json={"request_id": request_id, "thumb": "down"}, headers=AUTH
+            )
+            assert replay.status_code == 200
+            assert replay.json()["accepted"] is False
+
+    def test_replayed_feedback_does_not_inflate_stats(self, client):
+        """The confidence weighting keys off feedback_count, so the count
+        itself must not be inflatable by resubmitting the same request_id."""
+        with respx.mock:
+            respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
+            completion = client.post(
+                "/v1/chat/completions",
+                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                headers=AUTH,
+            )
+        request_id = completion.headers["x-chatrouter-request-id"]
+        model_id = completion.headers["x-chatrouter-model"]
+
+        for _ in range(10):
+            client.post(
+                "/v1/feedback", json={"request_id": request_id, "thumb": "down"}, headers=AUTH
+            )
+
+        service = client.app.state.service
+        stats = asyncio.run(service.feedback.get_stats(model_id, None))
+        assert stats.feedback_count == 1
 
     def test_feedback_without_signal_rejected(self, client):
         response = client.post("/v1/feedback", json={"request_id": "x"}, headers=AUTH)

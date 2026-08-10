@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from .api.auth import TenantRegistry
-from .config.models import AppConfig, ModelTier, TenantConfig
+from .config.models import AppConfig, ContextOverflowStrategy, ModelTier, TenantConfig
 from .core.errors import (
     ChatRouterError,
     InvalidRequestError,
@@ -32,14 +32,15 @@ from .core.schemas import (
     ModelList,
     new_request_id,
 )
-from .core.tokens import estimate_request_tokens
-from .core.types import DispatchResult, RequestContext, estimate_cost_usd
+from .core.tokens import count_message_tokens, estimate_request_tokens
+from .core.types import DispatchResult, RequestContext, RoutingDecision, estimate_cost_usd
 from .governance.circuit_breaker import BreakerState, CircuitBreakerRegistry
 from .governance.load import ModelLoadTracker
 from .governance.quota import QuotaManager
 from .governance.rate_limit import RateLimiter
 from .observability import metrics
 from .observability.logging import bind_request_context, clear_request_context, get_logger
+from .routing.context_fit import fits, trim_to_fit
 from .routing.feedback import FeedbackStore
 from .routing.router import Router
 from .storage import Storage, build_storage
@@ -151,6 +152,11 @@ class GatewayService:
             if decision.assessment:
                 headers["x-chatrouter-complexity"] = f"{decision.assessment.score:.3f}"
                 headers["x-chatrouter-tier"] = decision.assessment.tier.value
+
+            # --- context overflow -------------------------------------------
+            # Applied after routing because the budget depends on the model
+            # that was actually selected.
+            self._apply_context_overflow(request, decision, headers)
 
             self._record_decision_metrics(decision)
             logger.info(
@@ -388,6 +394,44 @@ class GatewayService:
 
     # -- feedback API ------------------------------------------------------------
 
+    def _apply_context_overflow(
+        self,
+        request: ChatCompletionRequest,
+        decision: RoutingDecision,
+        headers: dict[str, str],
+    ) -> None:
+        """Trim the conversation if it cannot fit the selected model.
+
+        Only runs under the ``trim_history`` strategy. The other strategies
+        either reject earlier in routing or accept the risk of routing to the
+        widest model as-is.
+        """
+        cfg = self.config.routing.context_overflow
+        if cfg.strategy is not ContextOverflowStrategy.TRIM_HISTORY:
+            return
+
+        model = decision.model
+        reserve = request.requested_max_tokens or 0
+        prompt_tokens = count_message_tokens(request.messages, model.id)
+        if fits(model, prompt_tokens, reserve):
+            return
+
+        result = trim_to_fit(request.messages, model, cfg, reserve)
+        if not result.trimmed:
+            return
+
+        request.messages = result.messages
+        decision.notes.extend(result.notes)
+        headers["x-chatrouter-context-trimmed"] = str(result.removed_messages)
+        metrics.CONTEXT_TRIMMED.labels(model=model.id).inc()
+        logger.warning(
+            "conversation trimmed to fit context window",
+            model=model.id,
+            removed=result.removed_messages,
+            before=result.original_tokens,
+            after=result.final_tokens,
+        )
+
     async def submit_feedback(self, payload: FeedbackRequest) -> FeedbackResponse:
         """Apply explicit user feedback to the adaptive routing statistics."""
         score = payload.normalised_score()
@@ -397,12 +441,19 @@ class GatewayService:
                 "regenerated or edited"
             )
 
-        record = await self.feedback.lookup_request(payload.request_id)
+        # Claiming consumes the record, so a request_id can only be scored
+        # once. Without this an attacker holding a request_id (it is returned
+        # in a response header) could replay negative feedback until the model
+        # is evicted from routing.
+        record = await self.feedback.claim_request(payload.request_id)
         if record is None:
             return FeedbackResponse(
                 accepted=False,
                 request_id=payload.request_id,
-                detail="unknown or expired request_id; feedback was discarded",
+                detail=(
+                    "request_id is unknown, expired, or has already received "
+                    "feedback; this submission was discarded"
+                ),
             )
 
         model_id = str(record.get("model_id"))

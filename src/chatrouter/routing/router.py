@@ -17,13 +17,19 @@ import random
 
 from ..config.models import (
     AppConfig,
+    ContextOverflowStrategy,
     ModelConfig,
     ModelTier,
     RoutingConfig,
     TenantConfig,
     TIERS_ASCENDING,
 )
-from ..core.errors import ModelNotFoundError, NoCandidateError, PermissionError_
+from ..core.errors import (
+    ContextOverflowError,
+    ModelNotFoundError,
+    NoCandidateError,
+    PermissionError_,
+)
 from ..core.schemas import ChatCompletionRequest
 from ..core.types import (
     ComplexityAssessment,
@@ -35,6 +41,7 @@ from ..core.types import (
 from ..governance.circuit_breaker import CircuitBreakerRegistry
 from ..governance.load import LoadSnapshot, ModelLoadTracker
 from .complexity import ComplexityAnalyzer
+from .context_fit import largest_window_model
 from .feedback import FeedbackStore
 
 # Utility penalty applied per tier of distance from the target tier.
@@ -123,8 +130,7 @@ class Router:
 
         capable = [m for m in allowed if self._is_capable(m, assessment, projected_tokens)]
         if not capable:
-            notes.append("no model satisfied capability requirements; relaxing constraints")
-            capable = allowed
+            capable = self._handle_no_capable(allowed, assessment, projected_tokens, notes)
 
         # Apply the tenant ceiling *after* scoring the task honestly, so the
         # decision log shows what the task needed versus what it was allowed.
@@ -267,6 +273,47 @@ class Router:
         if projected_tokens and projected_tokens > model.context_window:
             return False
         return True
+
+    def _handle_no_capable(
+        self,
+        allowed: list[ModelConfig],
+        assessment: ComplexityAssessment,
+        projected_tokens: int,
+        notes: list[str],
+    ) -> list[ModelConfig]:
+        """Recover when the capability filter eliminated every model.
+
+        Context overflow is treated separately from other capability misses:
+        relaxing a vision/tools requirement only degrades quality, but ignoring
+        the context window guarantees an upstream 400. So when overflow is the
+        cause we narrow to the models that can actually hold the prompt, and
+        only fall back to "relax everything" when it is not.
+        """
+        needed = max(assessment.prompt_tokens_estimate, projected_tokens)
+        overflowed = [m for m in allowed if needed > m.context_window]
+
+        if overflowed and len(overflowed) == len(allowed):
+            strategy = self._routing.context_overflow.strategy
+            if strategy is ContextOverflowStrategy.REJECT:
+                largest = largest_window_model(allowed)
+                limit = largest.context_window if largest else 0
+                raise ContextOverflowError(
+                    f"conversation requires ~{needed} tokens but the largest "
+                    f"available model holds {limit}"
+                )
+            # For both largest_window and trim_history the routing target is
+            # the same: the widest window available. Trimming (if enabled) is
+            # applied by the service once the model is known.
+            largest = largest_window_model(allowed)
+            if largest is not None:
+                notes.append(
+                    f"context overflow (~{needed} tokens) → routing to "
+                    f"widest-window model {largest.id} ({largest.context_window})"
+                )
+                return [largest]
+
+        notes.append("no model satisfied capability requirements; relaxing constraints")
+        return allowed
 
     def _effective_ceiling(self, tenant: TenantConfig, hints) -> ModelTier | None:
         ceilings = [t for t in (tenant.max_tier, self._parse_tier(hints.max_tier if hints else None)) if t]

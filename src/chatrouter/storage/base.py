@@ -111,5 +111,20 @@ class Storage(abc.ABC):
         """Store a record that expires automatically."""
 
     @abc.abstractmethod
-    async def take_record(self, key: str) -> dict[str, Any] | None:
-        """Read a record without removing it."""
+    async def read_record(self, key: str) -> dict[str, Any] | None:
+        """Read a record without consuming it.
+
+        Use this for introspection only. Anything that mutates learned state
+        on the basis of a record must use :meth:`claim_record` instead.
+        """
+
+    @abc.abstractmethod
+    async def claim_record(self, key: str) -> dict[str, Any] | None:
+        """Atomically read *and* consume a record.
+
+        Returns the record to exactly one caller; every subsequent call for the
+        same key returns ``None``. This is the primitive that makes
+        request→feedback correlation single-shot, preventing a client that
+        holds a ``request_id`` from replaying feedback to poison the adaptive
+        routing statistics.
+        """

@@ -70,8 +70,20 @@ class FeedbackStore:
             _REQUEST_TTL_SECONDS,
         )
 
-    async def lookup_request(self, request_id: str) -> dict[str, Any] | None:
-        return await self._storage.take_record(self._request_key(request_id))
+    async def claim_request(self, request_id: str) -> dict[str, Any] | None:
+        """Consume the correlation record so feedback can be applied *once*.
+
+        Returning the record to a single caller is what makes explicit feedback
+        non-replayable: ``request_id`` is handed to clients in the
+        ``x-chatrouter-request-id`` response header, so a merely-readable
+        record would let anyone submit unlimited scores for a model and drive
+        it out of the candidate pool.
+        """
+        return await self._storage.claim_record(self._request_key(request_id))
+
+    async def peek_request(self, request_id: str) -> dict[str, Any] | None:
+        """Read the correlation record without consuming it (introspection)."""
+        return await self._storage.read_record(self._request_key(request_id))
 
     # -- statistics updates -------------------------------------------------
 

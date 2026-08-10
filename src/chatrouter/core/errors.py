@@ -53,6 +53,18 @@ class InvalidRequestError(ChatRouterError):
     code = "invalid_request"
 
 
+class ContextOverflowError(ChatRouterError):
+    """The conversation is longer than any available model can accept.
+
+    Classified 400 rather than 503: no amount of retrying or extra capacity
+    helps, the client must shorten the conversation.
+    """
+
+    status_code = 400
+    error_type = "invalid_request_error"
+    code = "context_length_exceeded"
+
+
 class ModelNotFoundError(ChatRouterError):
     status_code = 404
     error_type = "invalid_request_error"

@@ -33,6 +33,16 @@ end
 return {requests, tokens, cost}
 """
 
+# Read and delete in one step. A GET followed by a DEL would let two replicas
+# both observe the record and apply feedback twice.
+_CLAIM_RECORD_LUA = """
+local value = redis.call('GET', KEYS[1])
+if value then
+    redis.call('DEL', KEYS[1])
+end
+return value
+"""
+
 
 class RedisStorage(Storage):
     """Redis-backed implementation of the storage contract."""
@@ -43,6 +53,7 @@ class RedisStorage(Storage):
         self._client: Any = None
         self._incr_window_script: Any = None
         self._add_usage_script: Any = None
+        self._claim_record_script: Any = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -56,6 +67,7 @@ class RedisStorage(Storage):
         await self._client.ping()
         self._incr_window_script = self._client.register_script(_INCR_WINDOW_LUA)
         self._add_usage_script = self._client.register_script(_ADD_USAGE_LUA)
+        self._claim_record_script = self._client.register_script(_CLAIM_RECORD_LUA)
 
     async def close(self) -> None:
         if self._client is not None:
@@ -218,12 +230,21 @@ class RedisStorage(Storage):
         client = self._require_client()
         await client.set(self._k(key), json.dumps(value, ensure_ascii=False), ex=ttl_seconds)
 
-    async def take_record(self, key: str) -> dict[str, Any] | None:
+    async def read_record(self, key: str) -> dict[str, Any] | None:
         client = self._require_client()
         raw = await client.get(self._k(key))
+        return self._decode_record(raw)
+
+    async def claim_record(self, key: str) -> dict[str, Any] | None:
+        self._require_client()
+        raw = await self._claim_record_script(keys=[self._k(key)], args=[])
+        return self._decode_record(raw)
+
+    @staticmethod
+    def _decode_record(raw: Any) -> dict[str, Any] | None:
         if not raw:
             return None
         try:
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             return None

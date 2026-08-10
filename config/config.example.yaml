@@ -36,6 +36,17 @@ routing:
     standard_max: 0.55
     premium_max: 0.80
 
+  # What to do when a conversation outgrows every model's context window.
+  #   reject         - fail fast with HTTP 400
+  #   largest_window - route to the widest-window model (default)
+  #   trim_history   - drop middle turns to make it fit (lossy)
+  context_overflow:
+    strategy: largest_window
+    trim_target_ratio: 0.7       # share of the window the prompt may occupy
+    keep_leading_messages: 1     # never drop the system prompt
+    keep_trailing_messages: 4    # never drop the current question
+    insert_elision_notice: true  # tell the model that history was removed
+
   context:
     enabled: true
     max_messages_analysed: 40

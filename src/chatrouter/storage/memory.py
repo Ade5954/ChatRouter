@@ -187,10 +187,20 @@ class MemoryStorage(Storage):
     async def put_record(self, key: str, value: dict[str, Any], ttl_seconds: int) -> None:
         self._records[self._k(key)] = _Bucket(dict(value), time.time() + ttl_seconds)
 
-    async def take_record(self, key: str) -> dict[str, Any] | None:
+    async def read_record(self, key: str) -> dict[str, Any] | None:
         now = time.time()
         bucket = self._records.get(self._k(key))
         if bucket is None or bucket.expired(now):
             self._records.pop(self._k(key), None)
             return None
         return dict(bucket.value)
+
+    async def claim_record(self, key: str) -> dict[str, Any] | None:
+        # The pop must happen under the lock: two concurrent claims for the
+        # same key must not both observe a live bucket.
+        now = time.time()
+        async with self._lock:
+            bucket = self._records.pop(self._k(key), None)
+            if bucket is None or bucket.expired(now):
+                return None
+            return dict(bucket.value)
