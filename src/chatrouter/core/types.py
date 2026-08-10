@@ -24,6 +24,7 @@ class RoutingDecisionReason(str, Enum):
     TENANT_CEILING = "tenant_ceiling"
     FALLBACK_CHAIN = "fallback_chain"
     DEFAULT_MODEL = "default_model"
+    SESSION_AFFINITY = "session_affinity"
 
 
 @dataclass(slots=True)

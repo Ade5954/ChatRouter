@@ -240,6 +240,17 @@ class RedisStorage(Storage):
         raw = await self._claim_record_script(keys=[self._k(key)], args=[])
         return self._decode_record(raw)
 
+    # -- session affinity ------------------------------------------------
+
+    async def get_session_model(self, session_id: str) -> str | None:
+        client = self._require_client()
+        value = await client.get(self._k(f"affinity:{session_id}"))
+        return value if value else None
+
+    async def set_session_model(self, session_id: str, model_id: str, ttl_seconds: int) -> None:
+        client = self._require_client()
+        await client.set(self._k(f"affinity:{session_id}"), model_id, ex=ttl_seconds)
+
     @staticmethod
     def _decode_record(raw: Any) -> dict[str, Any] | None:
         if not raw:

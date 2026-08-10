@@ -305,6 +305,30 @@ class ContextOverflowConfig(BaseModel):
     insert_elision_notice: bool = True
 
 
+class SessionAffinityConfig(BaseModel):
+    """Keep a multi-turn conversation on one model to preserve prompt caches.
+
+    Prefix caching (DeepSeek, Claude, Gemini, GPT-4o-class models) gives 75–90%
+    cheaper input tokens when the same prefix repeats on the *same* model. Routing
+    each turn to the cheapest-fit model shatters that prefix and forfeits the
+    saving — frequently worse than the routing saved. Session affinity counters
+    this by preferring the model a session already uses, unless the task's
+    complexity has drifted far enough to justify a switch.
+
+    ``stickiness`` is the cost penalty applied to *switching away* from the
+    session's current model, expressed in utility units (0 disables affinity,
+    1 strongly favours staying put). ``max_drift_tiers`` caps how far the chosen
+    model may sit from the natural target tier before affinity is overridden —
+    a session that suddenly needs reasoning will always be upgraded, never
+    pinned to a too-small model.
+    """
+
+    enabled: bool = True
+    stickiness: float = Field(default=0.4, ge=0.0, le=1.0)
+    max_drift_tiers: int = Field(default=1, ge=0)
+    ttl_seconds: int = Field(default=1800, gt=0)
+
+
 class RoutingConfig(BaseModel):
     """Top-level routing policy."""
 
@@ -326,6 +350,7 @@ class RoutingConfig(BaseModel):
     context_overflow: ContextOverflowConfig = Field(default_factory=ContextOverflowConfig)
     response_cache: ResponseCacheConfig = Field(default_factory=ResponseCacheConfig)
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
+    session_affinity: SessionAffinityConfig = Field(default_factory=SessionAffinityConfig)
 
 
 class CircuitBreakerConfig(BaseModel):

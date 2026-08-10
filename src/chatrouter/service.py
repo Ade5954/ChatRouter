@@ -74,7 +74,9 @@ class GatewayService:
         self.load_tracker = ModelLoadTracker(self.storage, config.resilience.overflow)
         self.feedback = FeedbackStore(self.storage, config.routing.feedback)
         self.feedback_normalizer = FeedbackNormalizer.from_feedback_config(config.routing.feedback)
-        self.router = Router(config, self.feedback, self.load_tracker, self.breakers)
+        self.router = Router(
+            config, self.feedback, self.load_tracker, self.breakers, self.storage
+        )
         self.rate_limiter = RateLimiter(self.storage)
         self.quotas = QuotaManager(self.storage)
         self.providers = ProviderPool(config.providers)

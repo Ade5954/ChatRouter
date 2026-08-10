@@ -204,3 +204,18 @@ class MemoryStorage(Storage):
             if bucket is None or bucket.expired(now):
                 return None
             return dict(bucket.value)
+
+    # -- session affinity ------------------------------------------------
+
+    async def get_session_model(self, session_id: str) -> str | None:
+        now = time.time()
+        bucket = self._records.get(self._k(f"affinity:{session_id}"))
+        if bucket is None or bucket.expired(now):
+            self._records.pop(self._k(f"affinity:{session_id}"), None)
+            return None
+        return bucket.value.get("model")
+
+    async def set_session_model(self, session_id: str, model_id: str, ttl_seconds: int) -> None:
+        self._records[self._k(f"affinity:{session_id}")] = _Bucket(
+            {"model": model_id}, time.time() + ttl_seconds
+        )

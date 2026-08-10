@@ -35,6 +35,17 @@ Ten signal dimensions participate in scoring, with Chinese/English recognition: 
 
 `/v1/routing/explain` surfaces the complete decision rationale without calling any model.
 
+### 1b. Session-Level Cache Affinity (the routing × caching trade-off)
+
+Routing by complexity saves tokens, but **switching models too often shatters the upstream prefix cache** — and for cache-friendly models (DeepSeek, Claude, Gemini, GPT-4o-class), a prefix hit cuts input cost by **75–90%**, often more than routing saves. If every turn hops to a differently-sized model, that large caching benefit is wasted.
+
+ChatRouter therefore ships **session-level cache affinity**: follow-up requests of the same `session_id` stay on the model already in use, unless the task's complexity drifts across more than `max_drift_tiers` (default 1 tier), in which case it upgrades/downgrades. Two mechanisms enforce it:
+
+- **Utility penalty**: in the routing utility function, any model *other than* the session's current one pays a penalty proportional to `stickiness` (default 0.4), so the router learns to avoid switching on its own.
+- **Hard-preference override**: if the session is already bound to a model whose tier is within the allowed drift of the target tier, that model is taken as the winner outright (`reason=session_affinity`), exploration is skipped, and the choice is written back for the next turn.
+
+Boundaries: for **stable multi-turn sessions / high-cache-hit models**, stickiness is almost always better; for **one-shot requests** or **conversations with violent complexity jumps**, affinity automatically yields to the true complexity. Toggle or tune it via `routing.session_affinity`.
+
 ### 2. Online Feedback-Loop Adaptive Routing
 
 The routing policy does not stay frozen at the prior values written in config; it continuously self-iterates from **real production data**:

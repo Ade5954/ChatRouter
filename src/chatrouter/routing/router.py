@@ -22,7 +22,6 @@ from ..config.models import (
     ModelTier,
     RoutingConfig,
     TenantConfig,
-    TIERS_ASCENDING,
 )
 from ..core.errors import (
     ContextOverflowError,
@@ -40,6 +39,7 @@ from ..core.types import (
 )
 from ..governance.circuit_breaker import CircuitBreakerRegistry
 from ..governance.load import LoadSnapshot, ModelLoadTracker
+from ..storage.base import Storage
 from .complexity import ComplexityAnalyzer
 from .context_fit import largest_window_model
 from .feedback import FeedbackStore
@@ -61,12 +61,14 @@ class Router:
         feedback: FeedbackStore,
         load_tracker: ModelLoadTracker,
         breakers: CircuitBreakerRegistry,
+        storage: Storage | None = None,
     ) -> None:
         self._config = config
         self._routing: RoutingConfig = config.routing
         self._feedback = feedback
         self._load = load_tracker
         self._breakers = breakers
+        self._storage = storage
         self._analyzer = ComplexityAnalyzer(config.routing.context, config.routing.thresholds)
         self._models = [m for m in config.models if m.enabled]
 
@@ -154,9 +156,21 @@ class Router:
 
         loads = await self._load.snapshot_many(capable)
 
+        affinity_cfg = self._routing.session_affinity
+        affinity_model_id = None
+        if affinity_cfg.enabled and context.session_id and self._storage is not None:
+            affinity_model_id = await self._storage.get_session_model(context.session_id)
+
         # --- 4. Scoring -------------------------------------------------------
         scored = await self._score_candidates(
-            capable, target_tier, tenant, hints, loads, projected_tokens
+            capable,
+            target_tier,
+            tenant,
+            hints,
+            loads,
+            projected_tokens,
+            affinity_model_id=affinity_model_id,
+            stickiness=affinity_cfg.stickiness if affinity_cfg.enabled else 0.0,
         )
         if not scored:
             raise NoCandidateError("all candidate models are unavailable")
@@ -180,12 +194,34 @@ class Router:
         winner = pool[0]
         exploration = False
 
+        # --- 4b. Session affinity override -----------------------------------
+        # If this session already routes to a model and the task has not drifted
+        # far from that model's tier, keep it there to preserve the upstream
+        # prefix cache (a 75–90% input-cost saving that routing would otherwise
+        # destroy). Affinity never overrides a hard capability/ceiling mismatch.
+        if (
+            affinity_model_id
+            and reason in (RoutingDecisionReason.CONTEXT_AWARE, RoutingDecisionReason.OVERFLOW)
+        ):
+            sticky = next((c for c in pool if c.model.id == affinity_model_id), None)
+            if sticky is not None:
+                drift = abs(sticky.model.tier.rank - target_tier.rank)
+                if drift <= affinity_cfg.max_drift_tiers:
+                    winner = sticky
+                    reason = RoutingDecisionReason.SESSION_AFFINITY
+                    notes.append(
+                        f"session affinity: staying on {winner.model.id} "
+                        f"(tier drift {drift} <= {affinity_cfg.max_drift_tiers})"
+                    )
+
         # --- 5. Exploration ---------------------------------------------------
         # Occasionally try a runner-up so under-served models keep producing
         # evidence; without this the feedback loop can lock onto a local optimum.
+        # Skipped when affinity already pinned the session to a sensible model.
         explore_ratio = self._routing.feedback.exploration_ratio
         if (
-            self._routing.feedback.enabled
+            reason is not RoutingDecisionReason.SESSION_AFFINITY
+            and self._routing.feedback.enabled
             and explore_ratio > 0
             and len(pool) > 1
             and random.random() < explore_ratio
@@ -206,6 +242,24 @@ class Router:
 
         if context.quota_downgraded:
             reason = RoutingDecisionReason.QUOTA_DOWNGRADE
+
+        # --- 4c. Persist affinity --------------------------------------------
+        # Remember the model we chose so the next turn of this session reuses it
+        # (and thus the prefix cache). Pinned/explicit models are already stable
+        # by definition, so only auto-routed decisions update the sticky record.
+        if (
+            affinity_cfg.enabled
+            and context.session_id
+            and self._storage is not None
+            and reason
+            not in (
+                RoutingDecisionReason.PINNED,
+                RoutingDecisionReason.EXPLICIT_MODEL,
+            )
+        ):
+            await self._storage.set_session_model(
+                context.session_id, winner.model.id, affinity_cfg.ttl_seconds
+            )
 
         fallbacks = await self._build_fallbacks(
             winner.model, tenant, projected_tokens, exclude={winner.model.id}, hints=hints
@@ -346,12 +400,23 @@ class Router:
         hints,
         loads: dict[str, LoadSnapshot],
         projected_tokens: int,
+        affinity_model_id: str | None = None,
+        stickiness: float = 0.0,
     ) -> list[ScoredCandidate]:
-        """Rank models by utility for the target tier."""
+        """Rank models by utility for the target tier.
+
+        ``affinity_model_id`` / ``stickiness`` encode session-affinity: switching
+        away from the session's current model forfeits the upstream prefix cache,
+        so every non-sticky model pays a penalty proportional to ``stickiness``.
+        """
         quality_bias = self._resolve_quality_bias(tenant, hints)
         latency_bias = self._routing.latency_bias
         cost_bias = max(0.0, 1.0 - quality_bias - latency_bias)
         preferred = set(hints.prefer_models) if hints else set()
+
+        # Switching models mid-session invalidates the prefix cache. The penalty
+        # is scaled by stickiness; the sticky model itself pays none.
+        affinity_penalty = 0.35 * stickiness
 
         candidates: list[ScoredCandidate] = []
         for model in models:
@@ -391,6 +456,8 @@ class Router:
             utility += 0.05 * (model.weight - 1.0)
             if model.id in preferred:
                 utility += 0.25
+            if affinity_model_id and model.id != affinity_model_id:
+                utility -= affinity_penalty
 
             # Nudge exploration towards models with little evidence so the
             # feedback loop can actually learn about them.

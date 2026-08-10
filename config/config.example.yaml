@@ -76,6 +76,15 @@ routing:
       instruction_density: 0.9
       requested_output_size: 0.7
 
+  # Keep a multi-turn conversation on the same model so the upstream prefix
+  # cache stays hot. Switching models mid-session throws that cache away (a
+  # 75–90% input-cost saving), which usually outweighs the routing saving.
+  session_affinity:
+    enabled: true
+    stickiness: 0.4        # 0 disables, 1 strongly prefers staying put
+    max_drift_tiers: 1     # allow switching only when task drifts this many tiers
+    ttl_seconds: 1800      # forget the sticky model after this idle period
+
   feedback:
     enabled: true
     ema_alpha: 0.1

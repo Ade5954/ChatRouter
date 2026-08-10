@@ -128,3 +128,13 @@ class Storage(abc.ABC):
         holds a ``request_id`` from replaying feedback to poison the adaptive
         routing statistics.
         """
+
+    # -- Session affinity (keep a conversation on one model) --------------
+
+    @abc.abstractmethod
+    async def get_session_model(self, session_id: str) -> str | None:
+        """Return the model a session was last routed to, or ``None``."""
+
+    @abc.abstractmethod
+    async def set_session_model(self, session_id: str, model_id: str, ttl_seconds: int) -> None:
+        """Remember the model a session was routed to (with expiry)."""
