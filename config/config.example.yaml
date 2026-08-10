@@ -1,0 +1,193 @@
+# ChatRouter configuration example.
+# Copy to config/config.yaml and adjust for your environment.
+# ${VAR} and ${VAR:-default} are expanded from the process environment.
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  require_auth: true
+  admin_api_key_env: CHATROUTER_ADMIN_KEY
+  cors_origins: []
+
+storage:
+  # "memory" is single-process only; use "redis" for multi-replica deployments.
+  backend: ${CHATROUTER_STORAGE:-memory}
+  redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+  key_prefix: chatrouter
+
+observability:
+  metrics_enabled: true
+  metrics_path: /metrics
+  log_level: ${LOG_LEVEL:-INFO}
+  log_json: true
+  log_request_bodies: false
+
+routing:
+  default_model: gpt-4o-mini
+  quality_bias: 0.6      # 0 = cheapest, 1 = best quality
+  latency_bias: 0.15
+  allow_upgrade: true
+  allow_downgrade: true
+  respect_explicit_model: true
+  auto_model_aliases: [auto, chatrouter-auto]
+
+  thresholds:
+    economy_max: 0.25
+    standard_max: 0.55
+    premium_max: 0.80
+
+  context:
+    enabled: true
+    max_messages_analysed: 40
+    recency_decay: 0.85
+    escalation_memory: 0.6
+    context_pressure_threshold: 0.35
+    signal_weights:
+      conversation_depth: 1.0
+      context_length: 1.0
+      reasoning_keywords: 1.5
+      code_content: 1.2
+      structured_output: 0.8
+      tool_usage: 1.0
+      multilingual: 0.5
+      unresolved_thread: 1.3
+      instruction_density: 0.9
+      requested_output_size: 0.7
+
+  feedback:
+    enabled: true
+    ema_alpha: 0.1
+    min_samples: 20
+    learning_rate: 0.3
+    exploration_ratio: 0.05
+    window_seconds: 3600
+    degraded_success_rate: 0.85
+    treat_retry_as_negative: true
+    treat_truncation_as_negative: true
+
+resilience:
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    failure_rate_threshold: 0.5
+    min_requests: 10
+    open_seconds: 30
+    half_open_max_calls: 3
+    window_seconds: 60
+  retry:
+    max_attempts: 3
+    enable_model_failover: true
+    backoff_base_seconds: 0.25
+    backoff_max_seconds: 4.0
+    retry_on_status: [408, 409, 425, 429, 500, 502, 503, 504]
+    retry_streaming_before_first_chunk: true
+  overflow:
+    enabled: true
+    saturation_threshold: 0.85
+    queue_enabled: true
+    queue_max_wait_seconds: 5.0
+    queue_max_depth: 500
+    allow_cross_tier_overflow: true
+
+providers:
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    timeout_seconds: 120
+    max_connections: 200
+
+  - name: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 180
+
+  - name: local-vllm
+    base_url: ${VLLM_BASE_URL:-http://localhost:8001/v1}
+    api_key_env: VLLM_API_KEY
+    timeout_seconds: 120
+
+models:
+  - id: qwen2.5-7b
+    provider: local-vllm
+    upstream_model: Qwen/Qwen2.5-7B-Instruct
+    tier: economy
+    input_cost_per_1k: 0.0
+    output_cost_per_1k: 0.0
+    context_window: 32768
+    quality_prior: 0.45
+    latency_prior_ms: 700
+    max_concurrency: 64
+    tags: [self-hosted]
+
+  - id: gpt-4o-mini
+    provider: openai
+    upstream_model: gpt-4o-mini
+    tier: standard
+    input_cost_per_1k: 0.00015
+    output_cost_per_1k: 0.0006
+    context_window: 128000
+    max_output_tokens: 16384
+    supports_vision: true
+    quality_prior: 0.68
+    latency_prior_ms: 1200
+    max_rpm: 5000
+    max_tpm: 4000000
+
+  - id: gpt-4o
+    provider: openai
+    upstream_model: gpt-4o
+    tier: premium
+    input_cost_per_1k: 0.0025
+    output_cost_per_1k: 0.01
+    context_window: 128000
+    max_output_tokens: 16384
+    supports_vision: true
+    quality_prior: 0.85
+    latency_prior_ms: 2200
+    max_rpm: 3000
+    max_tpm: 2000000
+
+  - id: deepseek-reasoner
+    provider: deepseek
+    upstream_model: deepseek-reasoner
+    tier: reasoning
+    input_cost_per_1k: 0.00055
+    output_cost_per_1k: 0.00219
+    context_window: 65536
+    max_output_tokens: 8192
+    supports_tools: false
+    quality_prior: 0.90
+    latency_prior_ms: 9000
+    max_rpm: 500
+    tags: [chain-of-thought]
+
+tenants:
+  - id: default
+    name: Default tenant
+    api_keys:
+      - ${CHATROUTER_DEFAULT_KEY:-sk-chatrouter-dev}
+    rate_limit:
+      rpm: 600
+      tpm: 1000000
+      max_concurrency: 64
+    quota:
+      period: day
+      max_tokens: 50000000
+      max_cost_usd: 200
+      on_exceed: downgrade
+
+  - id: free-tier
+    name: Free tier
+    api_keys:
+      - ${CHATROUTER_FREE_KEY:-sk-chatrouter-free}
+    rate_limit:
+      rpm: 60
+      tpm: 60000
+      max_concurrency: 8
+    quota:
+      period: day
+      max_requests: 1000
+      max_cost_usd: 1
+      on_exceed: reject
+    max_tier: standard
+    quality_bias: 0.3

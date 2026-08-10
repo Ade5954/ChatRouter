@@ -1,0 +1,36 @@
+services:
+  chatrouter:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Shared state so limits and learned statistics work across replicas.
+      CHATROUTER_STORAGE: redis
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: INFO
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      CHATROUTER_ADMIN_KEY: ${CHATROUTER_ADMIN_KEY:-change-me}
+      CHATROUTER_DEFAULT_KEY: ${CHATROUTER_DEFAULT_KEY:-sk-chatrouter-dev}
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:
