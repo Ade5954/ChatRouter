@@ -1,3 +1,5 @@
+[English](README.en.md) · 中文
+
 # ChatRouter
 
 面向生产环境、兼容 OpenAI 协议的 LLM 流量网关，专注于**智能请求路由**与**精细化流量治理**。

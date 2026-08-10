@@ -1,3 +1,5 @@
+English · [中文](README.md)
+
 # ChatRouter
 
 A production-oriented, OpenAI-compatible LLM traffic gateway focused on **intelligent request routing** and **fine-grained traffic governance**.
