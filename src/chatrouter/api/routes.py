@@ -64,6 +64,8 @@ async def chat_completions(
         )
 
     body, _ = await service.complete(context, projected_tokens)
+    if context.cache_hit:
+        headers["x-chatrouter-cache"] = "HIT"
     return JSONResponse(content=body, headers=headers)
 
 

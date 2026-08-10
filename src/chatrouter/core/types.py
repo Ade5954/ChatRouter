@@ -161,6 +161,9 @@ class RequestContext:
     decision: RoutingDecision | None = None
     attempts: list[AttemptRecord] = field(default_factory=list)
     quota_downgraded: bool = False
+    # Set when the completion was served from the exact-match cache, so the API
+    # layer can advertise it and the caller knows no fresh generation occurred.
+    cache_hit: bool = False
 
     @property
     def elapsed_ms(self) -> float:

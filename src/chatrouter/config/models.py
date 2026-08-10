@@ -234,6 +234,28 @@ class ContextOverflowStrategy(str, Enum):
     TRIM_HISTORY = "trim_history"
 
 
+class ResponseCacheConfig(BaseModel):
+    """Short-lived cache of exact-match completion results.
+
+    A request is served from cache only when every field that can change the
+    generated text is identical: the resolved target model, the full message
+    list, and the sampling parameters. Streaming requests are never cached
+    (the SSE stream is delivered live), and requests carrying a ``session_id``
+    hint are excluded so that multi-turn threads — which depend on prior state
+    the cache cannot see — never get a stale answer.
+    """
+
+    enabled: bool = False
+    # How long a cached completion stays usable.
+    ttl_seconds: int = Field(default=300, gt=0)
+    # Names of chatrouter hints whose presence forces a cache bypass. A session
+    # id means multi-turn state the cache cannot observe.
+    bypass_hints: list[str] = Field(default_factory=lambda: ["session_id"])
+    # Tenants listed here never read from or write to the cache. Useful for
+    # tenants that must always reach the model (e.g. audit or evaluation work).
+    excluded_tenants: list[str] = Field(default_factory=list)
+
+
 class ContextOverflowConfig(BaseModel):
     """Handling for prompts that no candidate model can accommodate.
 
@@ -275,6 +297,7 @@ class RoutingConfig(BaseModel):
     thresholds: TierThresholds = Field(default_factory=TierThresholds)
     context: ContextRoutingConfig = Field(default_factory=ContextRoutingConfig)
     context_overflow: ContextOverflowConfig = Field(default_factory=ContextOverflowConfig)
+    response_cache: ResponseCacheConfig = Field(default_factory=ResponseCacheConfig)
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
 
 

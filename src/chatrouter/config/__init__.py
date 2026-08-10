@@ -2,6 +2,7 @@
 
 from .loader import ConfigError, load_config, resolve_api_key, resolve_config_path
 from .models import (
+    TIERS_ASCENDING,
     AppConfig,
     CircuitBreakerConfig,
     ComplexitySignalWeights,
@@ -21,10 +22,10 @@ from .models import (
     StorageConfig,
     TenantConfig,
     TierThresholds,
-    TIERS_ASCENDING,
 )
 
 __all__ = [
+    "TIERS_ASCENDING",
     "AppConfig",
     "CircuitBreakerConfig",
     "ComplexitySignalWeights",
@@ -43,7 +44,6 @@ __all__ = [
     "RoutingConfig",
     "ServerConfig",
     "StorageConfig",
-    "TIERS_ASCENDING",
     "TenantConfig",
     "TierThresholds",
     "load_config",

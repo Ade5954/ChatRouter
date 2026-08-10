@@ -47,6 +47,17 @@ routing:
     keep_trailing_messages: 4    # never drop the current question
     insert_elision_notice: true  # tell the model that history was removed
 
+  # Cache identical non-streaming completions to avoid duplicate upstream calls.
+  # A hit requires every output-affecting field to match exactly; streaming and
+  # session-scoped requests are always bypassed. Enable to cut cost on repeated
+  # prompts (e.g. health checks, identical eval inputs).
+  response_cache:
+    enabled: false
+    ttl_seconds: 300
+    bypass_hints: [session_id]   # skip cache when multi-turn state is present
+    excluded_tenants: []         # tenants that must always reach the model
+
+
   context:
     enabled: true
     max_messages_analysed: 40

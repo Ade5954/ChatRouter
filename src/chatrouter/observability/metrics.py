@@ -176,6 +176,24 @@ FEEDBACK_TOTAL = _counter(
     ["model", "polarity"],
 )
 
+CACHE_HITS = _counter(
+    "chatrouter_response_cache_hits_total",
+    "Completion requests served from the exact-match cache.",
+    ["tenant", "model"],
+)
+
+CACHE_MISSES = _counter(
+    "chatrouter_response_cache_misses_total",
+    "Completion requests that required an upstream call (cache miss or bypass).",
+    ["tenant", "model", "reason"],
+)
+
+CACHE_STORED = _counter(
+    "chatrouter_response_cache_stored_total",
+    "Successful completions written to the cache.",
+    ["tenant", "model"],
+)
+
 
 def render_metrics() -> tuple[bytes, str]:
     """Render the metrics exposition payload."""

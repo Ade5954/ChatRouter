@@ -17,7 +17,13 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from .api.auth import TenantRegistry
-from .config.models import AppConfig, ContextOverflowStrategy, ModelTier, TenantConfig
+from .cache.response_cache import ResponseCache
+from .config.models import (
+    AppConfig,
+    ContextOverflowStrategy,
+    ModelConfig,
+    TenantConfig,
+)
 from .core.errors import (
     ChatRouterError,
     InvalidRequestError,
@@ -71,6 +77,7 @@ class GatewayService:
         self.quotas = QuotaManager(self.storage)
         self.providers = ProviderPool(config.providers)
         self.dispatcher = Dispatcher(config, self.providers, self.breakers, self.load_tracker)
+        self.response_cache = ResponseCache(config.routing.response_cache, self.storage)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -177,8 +184,44 @@ class GatewayService:
     async def complete(
         self, context: RequestContext, projected_tokens: int
     ) -> tuple[dict[str, Any], DispatchResult]:
-        """Serve a non-streaming completion."""
+        """Serve a non-streaming completion, short-circuiting on a cache hit."""
         tenant = context.tenant
+        cache = self.response_cache
+        decision = context.decision
+        model = decision.model if decision else None
+
+        if (
+            model is not None
+            and cache.should_participate(context.request, tenant)
+        ):
+            key = cache.key_for(context.request, model)
+            entry = await cache.get(key)
+            if entry is not None:
+                payload = entry["payload"]
+                cached_model_id = entry.get("model_id") or model.id
+                cached_model = self.config.model_by_id(cached_model_id) or model
+                result = self._result_from_cache(context, cached_model, payload, projected_tokens)
+                metrics.CACHE_HITS.labels(tenant=tenant.id, model=cached_model.id).inc()
+                # Accounting still runs on a hit: quota, billing and the feedback
+                # loop must see the request even though no upstream call happened.
+                try:
+                    await self._finalise_success(context, result, projected_tokens)
+                finally:
+                    await self.rate_limiter.release(tenant)
+                context.cache_hit = True
+                return result.payload, result
+
+            metrics.CACHE_MISSES.labels(tenant=tenant.id, model=model.id, reason="miss").inc()
+        elif model is not None:
+            reason = (
+                "streaming"
+                if context.request.stream
+                else "disabled"
+                if not self.config.routing.response_cache.enabled
+                else "excluded"
+            )
+            metrics.CACHE_MISSES.labels(tenant=tenant.id, model=model.id, reason=reason).inc()
+
         try:
             result = await self.dispatcher.dispatch(context, projected_tokens)
         except ChatRouterError as exc:
@@ -188,7 +231,54 @@ class GatewayService:
             await self.rate_limiter.release(tenant)
 
         await self._finalise_success(context, result, projected_tokens)
+
+        # Write-through: a clean success becomes a cache entry for the exact
+        # request that produced it.
+        if (
+            cache.should_participate(context.request, tenant)
+            and decision is not None
+            and result.completion_tokens > 0
+        ):
+            await cache.put(cache.key_for(context.request, model), result.payload, model.id)
+            metrics.CACHE_STORED.labels(tenant=tenant.id, model=model.id).inc()
+
         return result.payload, result
+
+    def _result_from_cache(
+        self,
+        context: RequestContext,
+        model: ModelConfig,
+        payload: dict[str, Any],
+        projected_tokens: int,
+    ) -> DispatchResult:
+        """Reconstruct a DispatchResult from a cached payload.
+
+        Token counts come from the cached ``usage`` block when present,
+        otherwise from the request estimate — accounting is approximate but
+        never zero, so quota and cost stay meaningful.
+        """
+        usage = payload.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0) or projected_tokens
+        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+
+        # A cached response belongs to the original request id, not a fresh one.
+        served = dict(payload)
+        served["model"] = model.id
+        served.setdefault("id", context.request_id)
+
+        return DispatchResult(
+            model=model,
+            payload=served,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=0.0,
+            attempts=0,
+            truncated=any(
+                c.get("finish_reason") == "length"
+                for c in served.get("choices", []) or []
+                if isinstance(c, dict)
+            ),
+        )
 
     async def stream(
         self, context: RequestContext, projected_tokens: int
