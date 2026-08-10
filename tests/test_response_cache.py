@@ -14,7 +14,7 @@ import respx
 from fastapi.testclient import TestClient
 
 from chatrouter.app import create_app
-from chatrouter.config.models import ResponseCacheConfig, RoutingConfig
+from chatrouter.config.models import FeedbackConfig, ResponseCacheConfig, RoutingConfig
 
 from .conftest import make_config
 
@@ -52,7 +52,13 @@ def completion_body(model: str = "mid-1", content: str = "hello") -> dict:
 def cached_client():
     config = make_config(
         routing=RoutingConfig(
-            default_model="mid", response_cache=ResponseCacheConfig(enabled=True)
+            default_model="mid",
+            response_cache=ResponseCacheConfig(enabled=True),
+            # Disable epsilon-greedy exploration so identical requests always
+            # route to the same model. The response cache keys on the resolved
+            # model; with exploration on, the same request can land on different
+            # models across calls and spuriously miss the cache.
+            feedback=FeedbackConfig(enabled=False),
         )
     )
     app = create_app(config)
