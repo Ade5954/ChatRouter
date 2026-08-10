@@ -1,11 +1,13 @@
 """Full-conversation complexity analysis.
 
-Conventional routers score only the latest user turn, which systematically
+Naive single-turn routers score only the latest user turn, which systematically
 under-estimates threads where the hard requirement was stated earlier ("answer
 everything below as a formal proof"), where difficulty accumulated across turns
 (repeated clarifications, a failing test being debugged), or where the last
 message is a terse follow-up ("and the other case?") that inherits all the
-difficulty of its context.
+difficulty of its context. ChatRouter shares the "look at history" design goal
+of research routers such as MTRouter and Router-R1, but reaches it with
+explainable rule signals instead of learned history-model embeddings.
 
 This analyser therefore evaluates the *whole* dialogue with recency weighting
 plus an explicit escalation memory, so latent complexity is preserved.
