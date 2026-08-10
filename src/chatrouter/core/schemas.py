@@ -152,20 +152,18 @@ class FeedbackRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
     def normalised_score(self) -> float | None:
-        """Collapse the different feedback shapes into a [0, 1] score."""
-        if self.score is not None:
-            return self.score
-        if self.rating is not None:
-            return (self.rating - 1) / 4
-        if self.thumb is not None:
-            return 1.0 if self.thumb == "up" else 0.0
-        if self.accepted is not None:
-            return 1.0 if self.accepted else 0.0
-        if self.regenerated:
-            return 0.2
-        if self.edited:
-            return 0.5
-        return None
+        """Collapse the different feedback shapes into a [0, 1] score.
+
+        Delegates to :class:`FeedbackNormalizer` so the mapping is driven by
+        configuration and stays consistent with the service layer. Kept as a
+        convenience method; the service uses :meth:`FeedbackNormalizer.normalize`
+        to also recover the originating signal.
+        """
+        from ..config.models import FeedbackNormalizationConfig
+        from ..routing.feedback_normalizer import FeedbackNormalizer
+
+        result = FeedbackNormalizer(FeedbackNormalizationConfig()).normalize(self)
+        return result.score if result else None
 
 
 class FeedbackResponse(BaseModel):
@@ -173,6 +171,9 @@ class FeedbackResponse(BaseModel):
     request_id: str
     model: str | None = None
     applied_score: float | None = None
+    # Which signal produced ``applied_score`` (score / rating / thumb / accepted
+    # / regenerated / edited). ``None`` when the submission was discarded.
+    source: str | None = None
     detail: str | None = None
 
 

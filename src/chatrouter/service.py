@@ -48,6 +48,7 @@ from .observability import metrics
 from .observability.logging import bind_request_context, clear_request_context, get_logger
 from .routing.context_fit import fits, trim_to_fit
 from .routing.feedback import FeedbackStore
+from .routing.feedback_normalizer import FeedbackNormalizer
 from .routing.router import Router
 from .storage import Storage, build_storage
 from .upstream.client import ProviderPool
@@ -72,6 +73,7 @@ class GatewayService:
         self.breakers = CircuitBreakerRegistry(config.resilience.circuit_breaker)
         self.load_tracker = ModelLoadTracker(self.storage, config.resilience.overflow)
         self.feedback = FeedbackStore(self.storage, config.routing.feedback)
+        self.feedback_normalizer = FeedbackNormalizer.from_feedback_config(config.routing.feedback)
         self.router = Router(config, self.feedback, self.load_tracker, self.breakers)
         self.rate_limiter = RateLimiter(self.storage)
         self.quotas = QuotaManager(self.storage)
@@ -524,12 +526,13 @@ class GatewayService:
 
     async def submit_feedback(self, payload: FeedbackRequest) -> FeedbackResponse:
         """Apply explicit user feedback to the adaptive routing statistics."""
-        score = payload.normalised_score()
-        if score is None:
+        normalized = self.feedback_normalizer.normalize(payload)
+        if normalized is None:
             raise InvalidRequestError(
                 "feedback must include one of: score, rating, thumb, accepted, "
                 "regenerated or edited"
             )
+        score = normalized.score
 
         # Claiming consumes the record, so a request_id can only be scored
         # once. Without this an attacker holding a request_id (it is returned
@@ -554,10 +557,18 @@ class GatewayService:
             model=model_id, polarity="positive" if score >= 0.5 else "negative"
         ).inc()
         logger.info(
-            "feedback recorded", model=model_id, band=band, score=round(score, 3)
+            "feedback recorded",
+            model=model_id,
+            band=band,
+            score=round(score, 3),
+            source=normalized.source,
         )
         return FeedbackResponse(
-            accepted=True, request_id=payload.request_id, model=model_id, applied_score=score
+            accepted=True,
+            request_id=payload.request_id,
+            model=model_id,
+            applied_score=score,
+            source=normalized.source,
         )
 
     # -- introspection --------------------------------------------------------------

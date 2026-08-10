@@ -202,6 +202,29 @@ class TierThresholds(BaseModel):
         return ModelTier.REASONING
 
 
+class FeedbackNormalizationConfig(BaseModel):
+    """How heterogeneous feedback shapes collapse into a [0, 1] quality score.
+
+    Clients report satisfaction in many idioms — an explicit score, a 1–5
+    rating, a thumb, an accept/reject flag, or the behavioural signals of
+    regenerating / editing the answer. Each maps to a number, but hard-coding
+    the mapping inside the request schema hides it from operators and makes it
+    impossible to tune without a code change. Centralising the mapping here
+    keeps the routing loop explainable: the same normalised value flows into
+    the statistics regardless of how the client expressed themselves.
+    """
+
+    # Direct, unambiguous signals.
+    thumb_up_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    thumb_down_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    accept_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    reject_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Behavioural signals: regenerating the answer is a weak negative, editing
+    # it before use is a mild negative (the answer helped but needed work).
+    regenerated_score: float = Field(default=0.2, ge=0.0, le=1.0)
+    edited_score: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
 class FeedbackConfig(BaseModel):
     """Online feedback loop that adapts routing to observed quality."""
 
@@ -221,6 +244,10 @@ class FeedbackConfig(BaseModel):
     # Implicit signals derived from the request lifecycle.
     treat_retry_as_negative: bool = True
     treat_truncation_as_negative: bool = True
+    # Mapping that collapses the various feedback idioms into one score.
+    normalization: FeedbackNormalizationConfig = Field(
+        default_factory=FeedbackNormalizationConfig
+    )
 
 
 class ContextOverflowStrategy(str, Enum):

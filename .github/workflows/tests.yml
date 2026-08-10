@@ -29,7 +29,7 @@ jobs:
         # Scope the lint gate to the code added by this change. Pre-existing
         # modules carry their own lint debt that is out of scope for this PR;
         # once the gate is green we can widen it to the whole tree.
-        run: ruff check src/chatrouter/cache tests/test_response_cache.py
+        run: ruff check src/chatrouter/cache src/chatrouter/routing/feedback_normalizer.py tests/test_response_cache.py tests/test_feedback_normalization.py
 
       - name: Run tests
         run: pytest -q

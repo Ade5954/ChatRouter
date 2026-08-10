@@ -86,6 +86,19 @@ routing:
     degraded_success_rate: 0.85
     treat_retry_as_negative: true
     treat_truncation_as_negative: true
+    # How heterogeneous feedback collapses into one [0,1] quality score.
+    #   score   - used verbatim, no remap
+    #   rating  - 1->0.0 .. 5->1.0 (linear)
+    #   thumb   - up/down map directly to the two scores below
+    #   accepted- accept/reject map to the two scores below
+    #   regenerated / edited - behavioural weak signals, last-resort fallbacks
+    normalization:
+      thumb_up_score: 1.0
+      thumb_down_score: 0.0
+      accept_score: 1.0
+      reject_score: 0.0
+      regenerated_score: 0.2
+      edited_score: 0.5
 
 resilience:
   circuit_breaker:
