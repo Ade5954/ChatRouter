@@ -251,6 +251,13 @@ class RedisStorage(Storage):
         client = self._require_client()
         await client.set(self._k(f"affinity:{session_id}"), model_id, ex=ttl_seconds)
 
+    async def session_affinity_ttl(self, session_id: str) -> int:
+        client = self._require_client()
+        ttl = await client.ttl(self._k(f"affinity:{session_id}"))
+        # Redis returns -1 (no expiry) or -2 (missing); neither should be capped
+        # to the cache TTL, so treat them as "no live binding".
+        return int(ttl) if ttl and ttl > 0 else 0
+
     @staticmethod
     def _decode_record(raw: Any) -> dict[str, Any] | None:
         if not raw:

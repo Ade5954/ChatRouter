@@ -6,12 +6,17 @@ collide and a caller could receive another conversation's answer. We therefore
 hash the resolved target model, the message list, and the full set of sampling
 parameters (temperature, top_p, max_tokens, stop, tools, tool_choice,
 response_format, seed, user, n) plus the routing hints — because ``pin_model``
-or a tenant hint can change which model answers.
+can change which model answers.
 
-Streaming requests are excluded by the caller (the SSE stream is live and must
-not be replayed), as are requests carrying any ``bypass_hint`` such as a
-``session_id``: a multi-turn thread depends on prior state the cache cannot
-observe, so serving a cached answer there would be wrong.
+Session affinity vs. the response cache
+--------------------------------------
+With ``affinity_aware`` (default True) a request carrying a ``session_id`` is
+*not* bypassed. Instead the key is scoped to ``(session_id, resolved_model)``
+(see ``cache_keys``), so a sticky session reuses cached answers while a session
+that drifts to a different model gets an isolated key. Streaming requests are
+still excluded by the caller (the SSE stream is live and must not be replayed),
+and any hint listed in ``bypass_hints`` forces a bypass. When affinity awareness
+is off, ``session_id`` becomes a bypass hint automatically.
 """
 
 from __future__ import annotations
@@ -66,7 +71,9 @@ class ResponseCache:
         self, request: ChatCompletionRequest, resolved_model: ModelConfig
     ) -> str:
         """Deterministic cache key incorporating every output-affecting field."""
-        return cache_key_for_request(request, resolved_model)
+        return cache_key_for_request(
+            request, resolved_model, affinity_aware=self._config.affinity_aware
+        )
 
     async def get(self, key: str) -> _CacheEntry | None:
         raw = await self._storage.read_record(self._entry_key(key))
@@ -78,20 +85,34 @@ class ResponseCache:
             return None
         return raw
 
-    async def put(self, key: str, payload: dict[str, Any], model_id: str) -> None:
+    async def put(
+        self,
+        key: str,
+        payload: dict[str, Any],
+        model_id: str,
+        affinity_ttl_seconds: int | None = None,
+    ) -> None:
         """Store a successful completion.
 
         The cached value keeps the model id so accounting on a cache hit can
         attribute cost and tokens to the correct model even though no upstream
         call happens.
+
+        ``affinity_ttl_seconds`` is the remaining lifetime of the session's
+        affinity binding. When a cached answer is scoped to a session (affinity
+        awareness on), the entry must not outlive the affinity binding, or we
+        could serve a cached answer from a model the session has since drifted
+        away from. We therefore cap the entry TTL at ``min(cache_ttl,
+        affinity_ttl)``.
         """
+        ttl = self._config.ttl_seconds
+        if affinity_ttl_seconds is not None:
+            ttl = min(ttl, max(0, affinity_ttl_seconds))
         entry: _CacheEntry = {
             "payload": payload,
             "model_id": model_id,
         }
-        await self._storage.put_record(
-            self._entry_key(key), entry, ttl_seconds=self._config.ttl_seconds
-        )
+        await self._storage.put_record(self._entry_key(key), entry, ttl_seconds=ttl)
 
     @staticmethod
     def _entry_key(cache_key: str) -> str:

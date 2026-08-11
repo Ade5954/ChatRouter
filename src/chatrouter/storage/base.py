@@ -138,3 +138,12 @@ class Storage(abc.ABC):
     @abc.abstractmethod
     async def set_session_model(self, session_id: str, model_id: str, ttl_seconds: int) -> None:
         """Remember the model a session was routed to (with expiry)."""
+
+    @abc.abstractmethod
+    async def session_affinity_ttl(self, session_id: str) -> int:
+        """Remaining lifetime (seconds) of a session's affinity binding.
+
+        Returns 0 when the session has no live binding. Used to cap the TTL of a
+        response-cache entry scoped to the session, so a cached answer cannot
+        outlive the model the session is actually pinned to.
+        """

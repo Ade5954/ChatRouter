@@ -166,7 +166,55 @@ class TestResponseCache:
         # Both hit the upstream; streaming bypasses the cache entirely.
         assert calls["n"] == 2
 
-    def test_session_id_bypasses_cache(self, cached_client):
+    def test_session_id_bypasses_cache_when_affinity_unaware(self):
+        """Legacy mode: with affinity_aware off, a session_id forces a bypass so
+        multi-turn state the cache cannot observe is never served stale."""
+        config = make_config(
+            routing=RoutingConfig(
+                default_model="mid",
+                response_cache=ResponseCacheConfig(enabled=True, affinity_aware=False),
+                feedback=FeedbackConfig(enabled=False),
+            )
+        )
+        app = create_app(config)
+        calls = {"n": 0}
+
+        def _mk(content):
+            def _c(_):
+                calls["n"] += 1
+                return httpx.Response(200, json=completion_body(content=content))
+
+            return _c
+
+        with TestClient(app) as client, respx.mock:
+            respx.post(UPSTREAM).mock(side_effect=[_mk("s1"), _mk("s2")])
+            a = _ask(client, chatrouter={"session_id": "sess-1"})
+            b = _ask(client, chatrouter={"session_id": "sess-1"})
+        assert a.json()["choices"][0]["message"]["content"] == "s1"
+        assert b.json()["choices"][0]["message"]["content"] == "s2"
+        assert calls["n"] == 2
+
+    def test_session_affinity_aware_same_model_hits(self, cached_client):
+        """With affinity_aware on (default), an identical turn within a sticky
+        session reuses the cached answer — the two savings now stack."""
+        calls = {"n": 0}
+
+        def _count(_):
+            calls["n"] += 1
+            return httpx.Response(200, json=completion_body())
+
+        with respx.mock:
+            respx.post(UPSTREAM).mock(side_effect=_count)
+            first = _ask(cached_client, chatrouter={"session_id": "sess-a"})
+            assert first.headers.get("x-chatrouter-cache") is None
+            second = _ask(cached_client, chatrouter={"session_id": "sess-a"})
+        assert second.headers["x-chatrouter-cache"] == "HIT"
+        assert calls["n"] == 1
+
+    def test_session_affinity_aware_drift_to_other_model_misses(self, cached_client):
+        """If a session drifts to a different model (e.g. tier jump), the
+        session-scoped key changes, so the old model's cached answer is not
+        served — correctness is preserved across the drift."""
         calls = {"n": 0}
 
         def _mk(content):
@@ -177,11 +225,34 @@ class TestResponseCache:
             return _c
 
         with respx.mock:
-            respx.post(UPSTREAM).mock(side_effect=[_mk("s1"), _mk("s2")])
-            a = _ask(cached_client, chatrouter={"session_id": "sess-1"})
-            b = _ask(cached_client, chatrouter={"session_id": "sess-1"})
-        assert a.json()["choices"][0]["message"]["content"] == "s1"
-        assert b.json()["choices"][0]["message"]["content"] == "s2"
+            respx.post(UPSTREAM).mock(side_effect=[_mk("cheap-ans"), _mk("reasoner-ans")])
+            # Force economy on the first turn, reasoning on the second; the tier
+            # jump exceeds max_drift_tiers so affinity does not pin the session.
+            a = _ask(cached_client, chatrouter={"session_id": "sess-b", "min_tier": "economy"})
+            b = _ask(cached_client, chatrouter={"session_id": "sess-b", "min_tier": "reasoning"})
+        assert a.json()["choices"][0]["message"]["content"] == "cheap-ans"
+        assert b.json()["choices"][0]["message"]["content"] == "reasoner-ans"
+        # Different models => different session-scoped keys => both hit upstream.
+        assert calls["n"] == 2
+
+    def test_session_affinity_aware_distinct_sessions_miss(self, cached_client):
+        """Two different session ids scope the cache separately even with the
+        same messages and resolved model."""
+        calls = {"n": 0}
+
+        def _mk(content):
+            def _c(_):
+                calls["n"] += 1
+                return httpx.Response(200, json=completion_body(content=content))
+
+            return _c
+
+        with respx.mock:
+            respx.post(UPSTREAM).mock(side_effect=[_mk("x1"), _mk("x2")])
+            a = _ask(cached_client, chatrouter={"session_id": "sess-x"})
+            b = _ask(cached_client, chatrouter={"session_id": "sess-y"})
+        assert a.json()["choices"][0]["message"]["content"] == "x1"
+        assert b.json()["choices"][0]["message"]["content"] == "x2"
         assert calls["n"] == 2
 
     def test_disabled_cache_does_not_short_circuit(self):

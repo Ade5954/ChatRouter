@@ -243,7 +243,22 @@ class GatewayService:
             and decision is not None
             and result.completion_tokens > 0
         ):
-            await cache.put(cache.key_for(context.request, model), result.payload, model.id)
+            affinity_ttl: int | None = None
+            if (
+                self.config.routing.session_affinity.enabled
+                and context.session_id
+                and cache._config.affinity_aware
+            ):
+                # Cap the cache entry at the remaining affinity binding so a
+                # cached answer can never outlive the model the session is pinned
+                # to (which would otherwise serve a stale model's response).
+                affinity_ttl = await self.storage.session_affinity_ttl(context.session_id)
+            await cache.put(
+                cache.key_for(context.request, model),
+                result.payload,
+                model.id,
+                affinity_ttl_seconds=affinity_ttl,
+            )
             metrics.CACHE_STORED.labels(tenant=tenant.id, model=model.id).inc()
 
         return result.payload, result

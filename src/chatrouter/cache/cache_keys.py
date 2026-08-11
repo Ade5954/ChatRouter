@@ -2,10 +2,20 @@
 
 The key must include exactly the fields that affect the generated text. We
 deliberately exclude ``chatrouter`` hints *except* ``pin_model`` (which changes
-the answering model) — ``session_id``, ``min_tier`` etc. do not alter what the
-model produces, and including them would fragment the cache without improving
-correctness. ``stream`` is excluded too because streaming is rejected before
-this point and the underlying completion is identical.
+the answering model) — ``min_tier`` etc. do not alter what the model produces,
+and including them would fragment the cache without improving correctness.
+``stream`` is excluded too because streaming is rejected before this point and
+the underlying completion is identical.
+
+Session affinity vs. cache keys
+--------------------------------
+When a ``session_id`` is present and affinity awareness is on, the key becomes
+*session-scoped*: it includes the session id together with the resolved model.
+Because session affinity keeps a conversation on one model, identical turns
+within that session stay on the same model and can share the cache, while a
+session that drifts to a different model gets a different key — so a stale
+answer from the previous model can never be served. Without a session id the
+key is unchanged from the legacy form.
 """
 
 from __future__ import annotations
@@ -38,9 +48,16 @@ _SAMPLING_FIELDS = (
 
 
 def cache_key_for_request(
-    request: ChatCompletionRequest, resolved_model: ModelConfig
+    request: ChatCompletionRequest,
+    resolved_model: ModelConfig,
+    affinity_aware: bool = True,
 ) -> str:
-    """Build a canonical, order-independent key string for the request."""
+    """Build a canonical, order-independent key string for the request.
+
+    ``affinity_aware`` controls whether a ``session_id`` hint is folded into the
+    key (True) or ignored (False, legacy behaviour where the caller bypasses the
+    cache for sessions entirely).
+    """
     parts: dict[str, Any] = {
         # The model that actually answers. For "auto" the router resolves this,
         # so two identical prompts routed to different models must not share a
@@ -61,7 +78,15 @@ def cache_key_for_request(
     if hints is not None and hints.pin_model:
         parts["pin_model"] = hints.pin_model
 
+    # Session affinity awareness: scope the key to (session, model). The model
+    # component already isolates turns that drifted to a different model, so the
+    # cache is safe within a sticky session and stacks with prefix caching.
+    if affinity_aware and hints is not None and hints.session_id:
+        parts["session"] = {"id": hints.session_id, "model": resolved_model.id}
+
     canonical = json_dumps_sorted(parts)
+    # Prefix with the model for readability and to keep the model dimension in
+    # the key even when affinity awareness is off (legacy guarantee).
     return f"{resolved_model.id}|{canonical}"
 
 

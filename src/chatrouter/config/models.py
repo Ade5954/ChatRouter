@@ -267,20 +267,59 @@ class ResponseCacheConfig(BaseModel):
     A request is served from cache only when every field that can change the
     generated text is identical: the resolved target model, the full message
     list, and the sampling parameters. Streaming requests are never cached
-    (the SSE stream is delivered live), and requests carrying a ``session_id``
-    hint are excluded so that multi-turn threads — which depend on prior state
-    the cache cannot see — never get a stale answer.
+    (the SSE stream is delivered live).
+
+    Session affinity vs. response cache — the tension and its resolution
+    -------------------------------------------------------------------
+    Prefix caching at the upstream (DeepSeek/Claude/GPT-4o-class) rewards
+    keeping a multi-turn session on one model; the response cache rewards
+    serving an identical request without calling upstream at all. These two
+    savings used to be mutually exclusive: any request carrying a
+    ``session_id`` was excluded from the cache, so multi-turn threads could
+    never benefit from it.
+
+    ``affinity_aware`` (default True) resolves this by making the cache key
+    *session-scoped* instead of excluding the session: when a ``session_id``
+    is present the key incorporates both the session id and the resolved
+    model. Because session affinity already keeps the session on one model,
+    repeated identical turns hit the response cache *and* keep the upstream
+    prefix cache warm — the two savings now stack. If a session drifts to a
+    different model the ``model`` component of the key changes, so a stale
+    answer from the previous model can never be served. The legacy behaviour
+    (treat ``session_id`` as a hard bypass) is preserved by setting
+    ``affinity_aware=False``; in that mode ``session_id`` is added to
+    ``bypass_hints`` automatically.
     """
 
     enabled: bool = False
     # How long a cached completion stays usable.
     ttl_seconds: int = Field(default=300, gt=0)
-    # Names of chatrouter hints whose presence forces a cache bypass. A session
-    # id means multi-turn state the cache cannot observe.
-    bypass_hints: list[str] = Field(default_factory=lambda: ["session_id"])
+    # When True, a request carrying a ``session_id`` is cached with a
+    # session-scoped key (see module docstring). When False, ``session_id`` is
+    # treated as a hard bypass and such requests never touch the cache.
+    affinity_aware: bool = True
+    # Names of chatrouter hints whose presence forces a cache bypass. Populated
+    # automatically with ``session_id`` when ``affinity_aware`` is False; an
+    # affinity-aware cache instead keys on the session and does not bypass it.
+    bypass_hints: list[str] = Field(default_factory=list)
     # Tenants listed here never read from or write to the cache. Useful for
     # tenants that must always reach the model (e.g. audit or evaluation work).
     excluded_tenants: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sync_bypass_hints(self) -> ResponseCacheConfig:
+        """Keep ``bypass_hints`` consistent with ``affinity_aware``.
+
+        When affinity awareness is off, a session id means multi-turn state the
+        cache cannot observe, so it must be a bypass hint. When it is on, the
+        cache keys on the session and the hint must not force a bypass.
+        """
+        if not self.affinity_aware:
+            if "session_id" not in self.bypass_hints:
+                self.bypass_hints = [*self.bypass_hints, "session_id"]
+        else:
+            self.bypass_hints = [h for h in self.bypass_hints if h != "session_id"]
+        return self
 
 
 class ContextOverflowConfig(BaseModel):

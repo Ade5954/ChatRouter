@@ -219,3 +219,10 @@ class MemoryStorage(Storage):
         self._records[self._k(f"affinity:{session_id}")] = _Bucket(
             {"model": model_id}, time.time() + ttl_seconds
         )
+
+    async def session_affinity_ttl(self, session_id: str) -> int:
+        now = time.time()
+        bucket = self._records.get(self._k(f"affinity:{session_id}"))
+        if bucket is None or bucket.expired(now):
+            return 0
+        return int(max(0, bucket.expires_at - now))
