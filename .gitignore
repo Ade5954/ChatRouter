@@ -10,3 +10,6 @@ dist/
 build/
 *.log
 data/*.db
+
+# Local config (copy of config.example.yaml with real env-specific values)
+config/config.yaml

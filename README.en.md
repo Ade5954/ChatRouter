@@ -21,7 +21,7 @@ Naive **single-turn routers** score only the **latest user turn**, which systema
 | User replies "still wrong" three times in a row | Each turn looks short in isolation | Current tier is disproven, must upgrade |
 | A 40-turn architecture discussion | Final turn is just a follow-up | Must satisfy all accumulated constraints |
 
-> Note: the mis-estimation above is a limitation of **single-turn routing**, not of "conversation-aware routing" in general. Conversation-aware routers such as MTRouter, Router-R1, and LLMRouter share the same "look at history" design goal — the difference is that they typically represent context with learned **history-model joint embeddings**, whereas ChatRouter reaches the same goal with **explainable rule signals + recency weighting**, requiring no training data and yielding auditable, per-request decisions.
+> The mis-estimation above is a limitation of **single-turn routing**. ChatRouter reaches conversation-awareness with **explainable rule signals + recency weighting**, requiring no training data and yielding auditable, per-request decisions.
 
 ChatRouter scores the **full conversation history** and avoids context-task mismatch through three mechanisms:
 
@@ -46,33 +46,6 @@ ChatRouter therefore ships **session-level cache affinity**: follow-up requests 
 
 Boundaries: for **stable multi-turn sessions / high-cache-hit models**, stickiness is almost always better; for **one-shot requests** or **conversations with violent complexity jumps**, affinity automatically yields to the true complexity. Toggle or tune it via `routing.session_affinity`; each model's `cached_input_cost_per_1k` (cached-input price, e.g. ~0.5–0.1× the normal input price for OpenAI/DeepSeek) controls the stickiness strength.
 
-#### 1b.1 Benchmark: cache affinity vs naive routing
-
-`bench_cache_affinity.py` drives the real routing engine (no mocks) over 5 multi-turn conversations (with a system prompt + multi-turn user/assistant, 7,158 prompt tokens total) under three deployment strategies, and estimates input cost using DeepSeek-class pricing (75–90% saving on cache hit):
-
-| Strategy | Model switches | Prefix cache | Meaning |
-|----------|---------------|--------------|---------|
-| **No gateway** (one cheap cache-friendly model, e.g. direct DeepSeek) | 0 | Hot | Typical direct client call |
-| **Naive router** (re-picks best tier every turn, no session memory) | 8 | Cold (0% hit) | The behaviour the article criticises |
-| **ChatRouter + cache affinity** | 1 | Hot | This repo's feature |
-
-Input cost extrapolated to 10,000 conversations / month:
-
-| Cache saving | No-gateway $/mo | Naive router $/mo | ChatRouter+affinity $/mo | Affinity vs naive |
-|--------------|-----------------|-------------------|--------------------------|-------------------|
-| 75% | 0.09 | 0.20 | 0.09 | **−53.6%** |
-| 90% | 0.07 | 0.20 | 0.07 | **−64.3%** |
-
-Takeaway: **the naive per-turn router switches models 8 times and shatters the prefix cache, doubling input cost (0.09 → 0.20); enabling session affinity drops switches to 1, restores the hot prefix, and brings cost back down to the no-gateway floor — while keeping first-turn complexity awareness.** Savings scale linearly with conversation volume.
-
-Run it with:
-
-```bash
-python bench_cache_affinity.py
-```
-
-Methodology notes: cost uses a single DeepSeek-class low-price cache-friendly price to isolate the cache effect from tier price differences; we assume 80% of a multi-turn prompt is a reusable shared prefix (`SHARED_PREFIX_FRACTION=0.80`); the naive router re-selects independently each turn with no session memory, so its prefix cache is cold (0% hit).
-
 ### 2. Online Feedback-Loop Adaptive Routing
 
 The routing policy does not stay frozen at the prior values written in config; it continuously self-iterates from **real production data**:
@@ -81,7 +54,7 @@ The routing policy does not stay frozen at the prior values written in config; i
 - **Implicit signals**: retry counts, output truncation (`finish_reason=length`), latency regressions vs. baseline, and upstream failures are all automatically folded into quality evidence.
 - **Tier-stratified statistics**: stats accumulate per `(model, complexity tier)`. A model may excel at simple tasks but clearly weaken on strong-reasoning tasks — a global mean would hide this; tier-stratified stats do not.
 - **Confidence weighting**: the more samples, the stronger measured quality overrides the prior. A model with only two ratings barely moves decisions; after hundreds of ratings it dominates.
-- **Single-use**: each `request_id` can be scored only once; duplicate submissions are discarded (`accepted: false`). Because `request_id` is returned to the client via a response header, allowing replay would let any holder flood a model with arbitrary negative feedback and evict it from the candidate pool — a poisoning entry point that must be blocked at the door.
+- **Single-use**: each `request_id` can be scored only once; duplicate submissions are discarded (`accepted: false`), preventing feedback poisoning.
 - **Evidence half-life**: evidence older than the statistics window decays exponentially, so last week's one-off outage doesn't permanently drag the model down.
 - **Exploration**: with probability `exploration_ratio`, sample the sub-optimal candidate to avoid locking into a local optimum and keep generating usable evidence for long-tail models.
 
@@ -284,7 +257,7 @@ Full configuration reference is in `config/config.example.yaml`, every field com
 
 ```bash
 pip install -e ".[dev]"
-pytest              # 157 tests
+pytest              # 167 tests
 ruff check src tests
 ```
 
