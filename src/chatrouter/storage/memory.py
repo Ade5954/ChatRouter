@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .base import QuotaUsage, Storage
+from ..core.types import SessionAffinityBinding
 
 
 class _Bucket:
@@ -207,22 +208,24 @@ class MemoryStorage(Storage):
 
     # -- session affinity ------------------------------------------------
 
-    async def get_session_model(self, session_id: str) -> str | None:
+    async def get_session_affinity(self, session_id: str) -> SessionAffinityBinding | None:
         now = time.time()
         bucket = self._records.get(self._k(f"affinity:{session_id}"))
         if bucket is None or bucket.expired(now):
             self._records.pop(self._k(f"affinity:{session_id}"), None)
             return None
-        return bucket.value.get("model")
-
-    async def set_session_model(self, session_id: str, model_id: str, ttl_seconds: int) -> None:
-        self._records[self._k(f"affinity:{session_id}")] = _Bucket(
-            {"model": model_id}, time.time() + ttl_seconds
+        value = bucket.value
+        ttl_remaining = int(max(0, bucket.expires_at - now))
+        return SessionAffinityBinding(
+            model_id=value.get("model"),
+            prefix_tokens=int(value.get("prefix_tokens", 0) or 0),
+            ttl_remaining=ttl_remaining,
         )
 
-    async def session_affinity_ttl(self, session_id: str) -> int:
-        now = time.time()
-        bucket = self._records.get(self._k(f"affinity:{session_id}"))
-        if bucket is None or bucket.expired(now):
-            return 0
-        return int(max(0, bucket.expires_at - now))
+    async def set_session_affinity(
+        self, session_id: str, model_id: str, prefix_tokens: int, ttl_seconds: int
+    ) -> None:
+        self._records[self._k(f"affinity:{session_id}")] = _Bucket(
+            {"model": model_id, "prefix_tokens": int(prefix_tokens)},
+            time.time() + ttl_seconds,
+        )

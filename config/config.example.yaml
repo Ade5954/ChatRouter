@@ -81,7 +81,14 @@ routing:
   # 75–90% input-cost saving), which usually outweighs the routing saving.
   session_affinity:
     enabled: true
-    stickiness: 0.4        # 0 disables, 1 strongly prefers staying put
+    # Scale applied to the *real* switch penalty, which is now the business cost
+    # of forfeiting the session's upstream prefix cache (SeqRoute, arXiv 2026):
+    #   penalty_usd = historical_prefix_tokens * (c_in - c_cache)
+    # The gateway converts that USD loss into its utility score via a single
+    # constant (_SWITCH_PENALTY_USD_PER_UTILITY). 0 disables affinity; 1 applies
+    # the exact business cost; >1 amplifies it. The longer the conversation and
+    # the pricier the model's cache, the stronger the pull to stay put.
+    stickiness: 0.4
     max_drift_tiers: 1     # allow switching only when task drifts this many tiers
     ttl_seconds: 1800      # forget the sticky model after this idle period
 
@@ -169,6 +176,7 @@ models:
     tier: standard
     input_cost_per_1k: 0.00015
     output_cost_per_1k: 0.0006
+    cached_input_cost_per_1k: 0.000075   # OpenAI cache-read ≈ 50% of input
     context_window: 128000
     max_output_tokens: 16384
     supports_vision: true
@@ -183,6 +191,7 @@ models:
     tier: premium
     input_cost_per_1k: 0.0025
     output_cost_per_1k: 0.01
+    cached_input_cost_per_1k: 0.00125   # OpenAI cache-read ≈ 50% of input
     context_window: 128000
     max_output_tokens: 16384
     supports_vision: true
@@ -197,6 +206,7 @@ models:
     tier: reasoning
     input_cost_per_1k: 0.00055
     output_cost_per_1k: 0.00219
+    cached_input_cost_per_1k: 0.000055   # DeepSeek cache hit ≈ 10% of input
     context_window: 65536
     max_output_tokens: 8192
     supports_tools: false

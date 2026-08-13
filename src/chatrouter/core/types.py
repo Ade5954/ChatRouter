@@ -211,6 +211,22 @@ class DispatchResult:
 
 
 @dataclass(slots=True)
+class SessionAffinityBinding:
+    """A session's pinned model and the size of its upstream prefix cache.
+
+    ``prefix_tokens`` is the session's accumulated historical prefix (in tokens)
+    that would be served from the upstream prefix cache if the session stays on
+    ``model_id``. Switching models forfeits that cache, so the cost of switching
+    grows with ``prefix_tokens`` — exactly the quantity the SeqRoute switch-penalty
+    formula prices (``prefix_tokens * (c_in - c_cache)``).
+    """
+
+    model_id: str
+    prefix_tokens: int = 0
+    ttl_remaining: int = 0
+
+
+@dataclass(slots=True)
 class ModelRuntimeStats:
     """Live health and quality statistics for one model."""
 

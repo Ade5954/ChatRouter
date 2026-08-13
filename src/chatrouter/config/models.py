@@ -72,6 +72,14 @@ class ModelConfig(BaseModel):
     # Economics & capability metadata used by the scoring function.
     input_cost_per_1k: float = Field(default=0.0, ge=0.0)
     output_cost_per_1k: float = Field(default=0.0, ge=0.0)
+    # Cached-input (prefix-cache read) price per 1k tokens. When the upstream
+    # reuses a matching prefix, input tokens bill at this (lower) rate. Leave
+    # unset to declare "no cache discount is known": the router then assumes
+    # switching carries no cache-loss and applies no stickiness on that basis.
+    # Set it to the provider's cached-input price (e.g. OpenAI/DeepSeek cache
+    # reads are ~0.5-0.1x of the normal input price) to enable cost-aware
+    # session stickiness aligned with the SeqRoute switch-penalty.
+    cached_input_cost_per_1k: float | None = Field(default=None, ge=0.0)
     context_window: int = Field(default=128_000, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
     supports_tools: bool = True
@@ -96,6 +104,15 @@ class ModelConfig(BaseModel):
     def avg_cost_per_1k(self) -> float:
         """Blended cost assuming a 3:1 prompt/completion ratio."""
         return self.input_cost_per_1k * 0.75 + self.output_cost_per_1k * 0.25
+
+    @property
+    def cached_input_cost_eff(self) -> float:
+        """Effective cached-input price; falls back to the normal input price."""
+        return (
+            self.cached_input_cost_per_1k
+            if self.cached_input_cost_per_1k is not None
+            else self.input_cost_per_1k
+        )
 
 
 class RateLimitConfig(BaseModel):

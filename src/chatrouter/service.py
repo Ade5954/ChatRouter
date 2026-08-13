@@ -39,7 +39,13 @@ from .core.schemas import (
     new_request_id,
 )
 from .core.tokens import count_message_tokens, estimate_request_tokens
-from .core.types import DispatchResult, RequestContext, RoutingDecision, estimate_cost_usd
+from .core.types import (
+    DispatchResult,
+    RequestContext,
+    RoutingDecision,
+    RoutingDecisionReason,
+    estimate_cost_usd,
+)
 from .governance.circuit_breaker import BreakerState, CircuitBreakerRegistry
 from .governance.load import ModelLoadTracker
 from .governance.quota import QuotaManager
@@ -368,6 +374,7 @@ class GatewayService:
             attempts=result.attempts,
             latency_ms=round(context.elapsed_ms, 1),
         )
+        await self._update_session_affinity(context, model.id, result.prompt_tokens)
         clear_request_context()
 
     async def _finalise_stream(self, context: RequestContext, projected_tokens: int) -> None:
@@ -432,7 +439,41 @@ class GatewayService:
             cost_usd=round(cost, 6),
             ttft_ms=round(last.first_token_ms, 1) if last.first_token_ms else None,
         )
+        await self._update_session_affinity(context, model.id, prompt_tokens)
         clear_request_context()
+
+    async def _update_session_affinity(
+        self, context: RequestContext, model_id: str, prompt_tokens: int
+    ) -> None:
+        """Persist the model a session routed to, accumulating its cached prefix.
+
+        This is the single source of truth for session affinity: each turn's
+        prompt tokens are added to the session's historical prefix so the router
+        can price the real cost of switching away (prefix-cache loss,
+        ``prefix_tokens * (c_in - c_cache)``). Pinned/explicit-model sessions are
+        stable by construction and are skipped.
+        """
+        if self.storage is None or not context.session_id:
+            return
+        affinity_cfg = self.config.routing.session_affinity
+        if not affinity_cfg.enabled:
+            return
+        decision = context.decision
+        if decision is not None and decision.reason in (
+            RoutingDecisionReason.PINNED,
+            RoutingDecisionReason.EXPLICIT_MODEL,
+        ):
+            return
+        existing = await self.storage.get_session_affinity(context.session_id)
+        prev = existing.prefix_tokens if existing is not None else 0
+        model = self.config.model_by_id(model_id)
+        cap = model.context_window if model is not None else 0
+        new_prefix = prev + max(0, int(prompt_tokens))
+        if cap > 0:
+            new_prefix = min(new_prefix, cap)
+        await self.storage.set_session_affinity(
+            context.session_id, model_id, new_prefix, affinity_cfg.ttl_seconds
+        )
 
     async def _finalise_failure(
         self, context: RequestContext, projected_tokens: int, error: ChatRouterError

@@ -41,10 +41,10 @@ Routing by complexity saves tokens, but **switching models too often shatters th
 
 ChatRouter therefore ships **session-level cache affinity**: follow-up requests of the same `session_id` stay on the model already in use, unless the task's complexity drifts across more than `max_drift_tiers` (default 1 tier), in which case it upgrades/downgrades. Two mechanisms enforce it:
 
-- **Utility penalty**: in the routing utility function, any model *other than* the session's current one pays a penalty proportional to `stickiness` (default 0.4), so the router learns to avoid switching on its own.
+- **Utility penalty (dynamic, real cache loss)**: the switching penalty is no longer a hard-coded constant; it is computed in real time from the cost formula in [SeqRoute (arXiv 2026)](https://arxiv.org/abs/2602.11688) — leaving the session's current model forfeits the upstream prefix cache, and the one-time switch loss equals `historical prefix tokens × (c_in − c_cache)` USD (where `c_cache` comes from the model's `cached_input_cost_per_1k`, falling back to `c_in` when unset, i.e. no extra penalty). That loss is converted into the router's utility scale by a single constant and scaled by `stickiness` (default 0.4); setting it to 0 disables affinity, so models with a larger cache price gap (e.g. GPT-4o, DeepSeek) are naturally stickier while cheap models stay freely routable.
 - **Hard-preference override**: if the session is already bound to a model whose tier is within the allowed drift of the target tier, that model is taken as the winner outright (`reason=session_affinity`), exploration is skipped, and the choice is written back for the next turn.
 
-Boundaries: for **stable multi-turn sessions / high-cache-hit models**, stickiness is almost always better; for **one-shot requests** or **conversations with violent complexity jumps**, affinity automatically yields to the true complexity. Toggle or tune it via `routing.session_affinity`.
+Boundaries: for **stable multi-turn sessions / high-cache-hit models**, stickiness is almost always better; for **one-shot requests** or **conversations with violent complexity jumps**, affinity automatically yields to the true complexity. Toggle or tune it via `routing.session_affinity`; each model's `cached_input_cost_per_1k` (cached-input price, e.g. ~0.5–0.1× the normal input price for OpenAI/DeepSeek) controls the stickiness strength.
 
 #### 1b.1 Benchmark: cache affinity vs naive routing
 
@@ -264,6 +264,7 @@ utility = quality_preference × feedback-adjusted quality
         + load_score
         - tier_offset_penalty
         - health_penalty
+        - session_affinity_cache_loss_penalty (historical prefix tokens × (c_in − c_cache), see above)
 ```
 
 `routing.quality_bias` is the core knob: `0` is maximally cost-saving, `1` is maximally quality-focused, default `0.6`. Overridable per tenant.
@@ -294,6 +295,10 @@ Test coverage: complexity analysis (including the key context-awareness assertio
 ## Scope
 
 This project **focuses solely on backend LLM traffic governance** and does not include: agent workflow orchestration, RAG retrieval orchestration, model training/fine-tuning, or front-end UI.
+
+## References
+
+- **SeqRoute: Global Budget-Aware Sequential LLM Routing via Offline Reinforcement Learning** (arXiv 2026) — cost modeling of the prefix-cache loss from session switching. This project upgrades the fixed stickiness switching penalty into a dynamic, real cache-loss computation based on it. <https://arxiv.org/abs/2602.11688>
 
 ## License
 

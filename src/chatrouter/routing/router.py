@@ -36,6 +36,7 @@ from ..core.types import (
     RoutingDecision,
     RoutingDecisionReason,
     ScoredCandidate,
+    SessionAffinityBinding,
 )
 from ..governance.circuit_breaker import CircuitBreakerRegistry
 from ..governance.load import LoadSnapshot, ModelLoadTracker
@@ -50,6 +51,12 @@ _TIER_DISTANCE_PENALTY = 0.18
 _COST_CEILING = 0.05
 # Latency normalisation ceiling in milliseconds.
 _LATENCY_CEILING = 15_000.0
+
+# Convert a one-time prefix-cache-loss (USD) into router utility points. Tuned so
+# a sizeable cache loss on a premium model is a strong (but bounded) deterrent to
+# switching, while cheap models stay freely routable (SeqRoute, arXiv 2026).
+_SWITCH_PENALTY_USD_PER_UTILITY = 1.0
+_MAX_AFFINITY_PENALTY = 2.0
 
 
 class Router:
@@ -158,8 +165,12 @@ class Router:
 
         affinity_cfg = self._routing.session_affinity
         affinity_model_id = None
+        affinity_prefix_tokens = 0
         if affinity_cfg.enabled and context.session_id and self._storage is not None:
-            affinity_model_id = await self._storage.get_session_model(context.session_id)
+            binding = await self._storage.get_session_affinity(context.session_id)
+            if binding is not None:
+                affinity_model_id = binding.model_id
+                affinity_prefix_tokens = binding.prefix_tokens
 
         # --- 4. Scoring -------------------------------------------------------
         scored = await self._score_candidates(
@@ -170,6 +181,7 @@ class Router:
             loads,
             projected_tokens,
             affinity_model_id=affinity_model_id,
+            affinity_prefix_tokens=affinity_prefix_tokens,
             stickiness=affinity_cfg.stickiness if affinity_cfg.enabled else 0.0,
         )
         if not scored:
@@ -214,6 +226,19 @@ class Router:
                         f"(tier drift {drift} <= {affinity_cfg.max_drift_tiers})"
                     )
 
+        # Quantify, for observability, the real business cost of breaking this
+        # session's prefix cache by switching models (SeqRoute switch penalty).
+        if affinity_model_id and affinity_prefix_tokens > 0:
+            aff = self._config.model_by_id(affinity_model_id)
+            if aff is not None:
+                loss_usd = (affinity_prefix_tokens / 1000.0) * max(
+                    0.0, aff.input_cost_per_1k - aff.cached_input_cost_eff
+                )
+                notes.append(
+                    f"session affinity: switching forfeits ${loss_usd:.6f} of prefix "
+                    f"cache over {affinity_prefix_tokens} historical tokens"
+                )
+
         # --- 5. Exploration ---------------------------------------------------
         # Occasionally try a runner-up so under-served models keep producing
         # evidence; without this the feedback loop can lock onto a local optimum.
@@ -245,8 +270,11 @@ class Router:
 
         # --- 4c. Persist affinity --------------------------------------------
         # Remember the model we chose so the next turn of this session reuses it
-        # (and thus the prefix cache). Pinned/explicit models are already stable
-        # by definition, so only auto-routed decisions update the sticky record.
+        # (and thus the prefix cache). The historical prefix size is preserved
+        # here; the completion path (_update_session_affinity) then adds the
+        # just-finished turn's prompt tokens so the router can later price the
+        # switch penalty (prefix_tokens * (c_in - c_cache)). Pinned/explicit
+        # models are stable by definition and are skipped.
         if (
             affinity_cfg.enabled
             and context.session_id
@@ -257,8 +285,9 @@ class Router:
                 RoutingDecisionReason.EXPLICIT_MODEL,
             )
         ):
-            await self._storage.set_session_model(
-                context.session_id, winner.model.id, affinity_cfg.ttl_seconds
+            existing_prefix = binding.prefix_tokens if binding is not None else 0
+            await self._storage.set_session_affinity(
+                context.session_id, winner.model.id, existing_prefix, affinity_cfg.ttl_seconds
             )
 
         fallbacks = await self._build_fallbacks(
@@ -401,22 +430,37 @@ class Router:
         loads: dict[str, LoadSnapshot],
         projected_tokens: int,
         affinity_model_id: str | None = None,
+        affinity_prefix_tokens: int = 0,
         stickiness: float = 0.0,
     ) -> list[ScoredCandidate]:
         """Rank models by utility for the target tier.
 
-        ``affinity_model_id`` / ``stickiness`` encode session-affinity: switching
-        away from the session's current model forfeits the upstream prefix cache,
-        so every non-sticky model pays a penalty proportional to ``stickiness``.
+        Session affinity is priced by the real cost of breaking the session's
+        upstream prefix cache (SeqRoute, arXiv 2026): switching away from the
+        session's current model forfeits ``affinity_prefix_tokens * (c_in - c_cache)``
+        USD of cache, so every non-sticky model pays that penalty (scaled by
+        ``stickiness``; 0 disables affinity).
         """
         quality_bias = self._resolve_quality_bias(tenant, hints)
         latency_bias = self._routing.latency_bias
         cost_bias = max(0.0, 1.0 - quality_bias - latency_bias)
         preferred = set(hints.prefer_models) if hints else set()
 
-        # Switching models mid-session invalidates the prefix cache. The penalty
-        # is scaled by stickiness; the sticky model itself pays none.
-        affinity_penalty = 0.35 * stickiness
+        # Real, business-cost switch penalty (SeqRoute, arXiv 2026):
+        #   penalty_usd = historical_prefix_tokens * (c_in - c_cache)
+        # i.e. the one-time cache loss from abandoning this session's upstream
+        # prefix cache. We convert the USD loss into the router's utility scale
+        # with a single documented constant and let ``stickiness`` scale it.
+        affinity_penalty = 0.0
+        if affinity_model_id and affinity_prefix_tokens > 0:
+            aff = self._config.model_by_id(affinity_model_id)
+            if aff is not None:
+                cache_loss_per_1k = max(0.0, aff.input_cost_per_1k - aff.cached_input_cost_eff)
+                switch_loss_usd = (affinity_prefix_tokens / 1000.0) * cache_loss_per_1k
+                affinity_penalty = min(
+                    switch_loss_usd / _SWITCH_PENALTY_USD_PER_UTILITY,
+                    _MAX_AFFINITY_PENALTY,
+                ) * stickiness
 
         candidates: list[ScoredCandidate] = []
         for model in models:

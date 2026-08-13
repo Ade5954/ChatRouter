@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .base import QuotaUsage, Storage
+from ..core.types import SessionAffinityBinding
 
 # INCRBY + set TTL only when the key is new, returning the new total.
 _INCR_WINDOW_LUA = """
@@ -242,21 +243,32 @@ class RedisStorage(Storage):
 
     # -- session affinity ------------------------------------------------
 
-    async def get_session_model(self, session_id: str) -> str | None:
+    async def get_session_affinity(self, session_id: str) -> SessionAffinityBinding | None:
         client = self._require_client()
-        value = await client.get(self._k(f"affinity:{session_id}"))
-        return value if value else None
-
-    async def set_session_model(self, session_id: str, model_id: str, ttl_seconds: int) -> None:
-        client = self._require_client()
-        await client.set(self._k(f"affinity:{session_id}"), model_id, ex=ttl_seconds)
-
-    async def session_affinity_ttl(self, session_id: str) -> int:
-        client = self._require_client()
+        raw = await client.get(self._k(f"affinity:{session_id}"))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # Tolerate a plain-string binding written by an older revision.
+            return SessionAffinityBinding(model_id=raw, prefix_tokens=0, ttl_remaining=0)
         ttl = await client.ttl(self._k(f"affinity:{session_id}"))
         # Redis returns -1 (no expiry) or -2 (missing); neither should be capped
         # to the cache TTL, so treat them as "no live binding".
-        return int(ttl) if ttl and ttl > 0 else 0
+        ttl_remaining = int(ttl) if ttl and ttl > 0 else 0
+        return SessionAffinityBinding(
+            model_id=value.get("model"),
+            prefix_tokens=int(value.get("prefix_tokens", 0) or 0),
+            ttl_remaining=ttl_remaining,
+        )
+
+    async def set_session_affinity(
+        self, session_id: str, model_id: str, prefix_tokens: int, ttl_seconds: int
+    ) -> None:
+        client = self._require_client()
+        payload = json.dumps({"model": model_id, "prefix_tokens": int(prefix_tokens)})
+        await client.set(self._k(f"affinity:{session_id}"), payload, ex=ttl_seconds)
 
     @staticmethod
     def _decode_record(raw: Any) -> dict[str, Any] | None:

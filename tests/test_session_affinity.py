@@ -135,6 +135,11 @@ class TestSessionAffinity:
         try:
             await _route(svc, make_request([user("Summarise this paragraph.")]), "sess-pen2")
             assess = svc.router.analyse(make_request([user("Summarise this paragraph.")]))
+            # Price the cache loss so the affinity penalty is strong and
+            # deterministic: declare the session's model has a 0 cached-input
+            # price (the full input-cost gap), over a long historical prefix.
+            aff = svc.config.model_by_id(first.model.id)
+            aff.cached_input_cost_per_1k = 0.0
             candidates = await svc.router._score_candidates(
                 svc.router.models,
                 assess.tier,
@@ -143,6 +148,7 @@ class TestSessionAffinity:
                 {},
                 1000,
                 affinity_model_id=first.model.id,
+                affinity_prefix_tokens=1_000_000,
                 stickiness=1.0,
             )
             sticky = next(c for c in candidates if c.model.id == first.model.id)
@@ -161,15 +167,21 @@ class TestSessionModelStorage:
         await store.start()
         try:
             assert await store.get_session_model("x") is None
-            await store.set_session_model("x", "gpt-4o", 60)
+            await store.set_session_affinity("x", "gpt-4o", 1234, 60)
+            # Backwards-compatible view still returns just the model id.
             assert await store.get_session_model("x") == "gpt-4o"
+            binding = await store.get_session_affinity("x")
+            assert binding.model_id == "gpt-4o"
+            assert binding.prefix_tokens == 1234
+            assert binding.ttl_remaining > 0
         finally:
             await store.close()
 
     async def test_base_declares_affinity_methods(self):
         # Guard against accidental interface drift.
         assert hasattr(Storage, "get_session_model")
-        assert hasattr(Storage, "set_session_model")
+        assert hasattr(Storage, "get_session_affinity")
+        assert hasattr(Storage, "set_session_affinity")
         # Router must accept a storage handle (for affinity read/write).
         import inspect
 
