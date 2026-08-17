@@ -190,6 +190,19 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .candidate .meta { color: var(--muted); font-size: 11px; }
 
 .decision-header { display: flex; gap: 24px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.winner-name { font-size: 20px; font-weight: 600; }
 .notes { color: var(--muted); font-size: 12px; border-left: 3px solid var(--accent); padding-left: 12px; margin-top: 10px; }
 .notes li { margin: 3px 0; }
 .error-box { background: rgba(239, 93, 108, 0.12); border: 1px solid var(--bad); border-radius: 8px; padding: 12px; color: var(--bad); }
+
+/* ---------- candidate utility decomposition ---------- */
+.candidate { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.candidate:last-child { border-bottom: none; }
+.candidate.winner {
+  background: var(--panel2); border-radius: 8px; padding: 10px 12px; border-bottom: none;
+}
+.cand-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.candidate .util { color: var(--accent); font-weight: 600; font-size: 13px; }
+.dims { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 6px 0; }
+.dim .dim-name { display: block; color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+.cand-meta { color: var(--muted); font-size: 11px; }

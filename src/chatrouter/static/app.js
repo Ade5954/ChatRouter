@@ -234,31 +234,6 @@ function renderDecision(data) {
   const a = d.assessment;
   box.classList.remove("hidden");
 
-  const signals = a ? Object.entries(a.signals) : [];
-  const signalHtml = signals.length
-    ? `<div class="panel"><h2>复杂度信号</h2>
-        ${signals.filter(([, v]) => v > 0).map(([k, v]) => `
-          <div class="signal-row"><span class="name">${esc(k)}</span>
-            <div class="bar"><div class="fill" style="width:${(v * 100).toFixed(0)}%"></div></div>
-            <span class="val">${v.toFixed(2)}</span></div>`).join("")}
-        ${signals.some(([, v]) => v > 0) ? "" : '<div class="muted">所有信号均为 0（极简请求）</div>'}
-      </div>` : "";
-
-  const candidates = (d.candidates || []).map((c, i) => {
-    const width = (Math.max(0, c.utility) * 100).toFixed(1);
-    const isWin = i === 0;
-    return `
-    <div class="candidate ${isWin ? "winner" : ""}">
-      <span class="name">${isWin ? "✓ " : ""}${esc(c.model)} ${tierBadge(c.tier)}</span>
-      <div class="bar"><div class="fill" style="width:${width}%"></div></div>
-      <span class="meta">效用 ${c.utility.toFixed(3)} · 质量 ${c.quality.toFixed(3)} · 成本 ${c.cost_score.toFixed(2)} · 延迟 ${c.latency_score.toFixed(2)}</span>
-    </div>`;
-  }).join("");
-
-  const notes = (d.notes || []).length
-    ? `<div class="panel"><h2>决策说明</h2><ul class="notes">${d.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul></div>`
-    : "";
-
   box.innerHTML = `
     <div class="panel">
       <div class="decision-header">
@@ -267,20 +242,66 @@ function renderDecision(data) {
           <div class="muted">复杂度分数</div>
         </div>
         <div>
-          <div class="muted">选中模型</div>
-          <div style="font-size:20px;font-weight:600">${esc(d.model)} ${tierBadge(a ? a.tier : "")}</div>
+          <div class="muted">ChatRouter 选中</div>
+          <div class="winner-name">${esc(d.model)} ${tierBadge(a ? a.tier : "")}</div>
           <div class="muted">理由：${esc(d.reason)}${d.exploration ? "（探索）" : ""}</div>
         </div>
         <div>
           <div class="muted">预计输入</div>
-          <div style="font-size:20px;font-weight:600">${a ? a.prompt_tokens_estimate : "—"} tokens</div>
+          <div class="winner-name">${a ? a.prompt_tokens_estimate : "—"} tokens</div>
           <div class="muted">轮次：${a ? a.turn_count : "—"} · 降级链：${(d.fallback_chain || []).join(", ") || "—"}</div>
         </div>
       </div>
     </div>
-    ${signalHtml}
-    <div class="panel"><h2>候选模型效用</h2>${candidates || '<div class="muted">无候选数据</div>'}</div>
-    ${notes}`;
+    ${renderCandidates(d)}
+    ${renderSignals(a)}
+    ${(d.notes || []).length ? `<div class="panel"><h2>决策说明</h2><ul class="notes">${d.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul></div>` : ""}`;
+}
+
+/* Candidate ranking with the utility decomposed into its drivers. */
+function renderCandidates(d) {
+  const cands = d.candidates || [];
+  if (!cands.length) return "";
+  const maxUtil = Math.max(...cands.map((c) => Math.max(0, c.utility)), 1e-6);
+  const items = cands.map((c, i) => {
+    const width = ((Math.max(0, c.utility) / maxUtil) * 100).toFixed(1);
+    const isWin = i === 0;
+    const dims = [
+      ["质量", c.quality, "good"],
+      ["成本", c.cost_score, ""],
+      ["延迟", c.latency_score, ""],
+      ["负载", c.load_score, ""],
+    ].map(([n, v, cls]) => `
+      <div class="dim">
+        <span class="dim-name">${n}</span>
+        <div class="bar"><div class="fill ${cls}" style="width:${(v * 100).toFixed(0)}%"></div></div>
+      </div>`).join("");
+    return `
+    <div class="candidate ${isWin ? "winner" : ""}">
+      <div class="cand-head">
+        <span class="name">${isWin ? "✓ " : ""}${esc(c.model)} ${tierBadge(c.tier)}</span>
+        <span class="util">效用 ${c.utility.toFixed(3)}</span>
+      </div>
+      <div class="bar"><div class="fill" style="width:${width}%"></div></div>
+      <div class="dims">${dims}</div>
+      <div class="cand-meta">档距惩罚 ${c.tier_penalty.toFixed(3)} · 探索加成 ${c.exploration_bonus.toFixed(3)}</div>
+    </div>`;
+  }).join("");
+  return `<div class="panel"><h2>候选模型效用分解</h2>${items}</div>`;
+}
+
+function renderSignals(a) {
+  if (!a) return "";
+  const signals = Object.entries(a.signals);
+  const active = signals.filter(([, v]) => v > 0);
+  return `<div class="panel"><h2>复杂度信号</h2>
+    ${active.length
+      ? active.map(([k, v]) => `
+          <div class="signal-row"><span class="name">${esc(k)}</span>
+            <div class="bar"><div class="fill" style="width:${(v * 100).toFixed(0)}%"></div></div>
+            <span class="val">${v.toFixed(2)}</span></div>`).join("")
+      : '<div class="muted">所有信号均为 0（极简请求）</div>'}
+  </div>`;
 }
 
 /* ---------------- nav & wiring ---------------- */

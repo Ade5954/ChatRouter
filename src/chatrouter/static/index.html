@@ -73,7 +73,7 @@
         <h2>路由决策解释</h2>
         <p class="hint">
           输入一段对话，每行一条消息，格式 <code>role: 内容</code>（role 为 user / assistant / system / tool）。
-          网关会对<b>完整对话历史</b>打分并展示决策依据 —— 不真正调用上游模型。
+          网关会对<b>完整对话历史</b>打分并展示决策依据（不真正调用上游模型）。
         </p>
         <textarea id="convo" rows="10" spellcheck="false">user: 用归纳法证明这个递归算法的复杂度是最优的，并给出完整推导。
 assistant: 设递推式为 T(n)=2T(n/2)+O(n)，主定理给出 T(n)=O(n log n)。
