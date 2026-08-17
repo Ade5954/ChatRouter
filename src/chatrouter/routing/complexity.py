@@ -184,9 +184,17 @@ class ComplexityAnalyzer:
         self._thresholds = thresholds
 
     def analyse(
-        self, request: ChatCompletionRequest, context_window_hint: int = 128_000
+        self,
+        request: ChatCompletionRequest,
+        context_window_hint: int = 128_000,
+        prompt_tokens: int | None = None,
     ) -> ComplexityAssessment:
-        """Score the request against the full dialogue history."""
+        """Score the request against the full dialogue history.
+
+        ``prompt_tokens`` lets the caller reuse a token count computed earlier
+        (e.g. by the gateway's prepare stage) instead of tokenising the
+        conversation again — tokenisation is one of the more expensive steps.
+        """
         messages = request.messages
         cfg = self._config
         explanation: list[str] = []
@@ -195,7 +203,8 @@ class ComplexityAnalyzer:
         if not analysed:
             analysed = messages[-1:] if messages else []
 
-        prompt_tokens = count_message_tokens(messages) + count_tools_tokens(request.tools)
+        if prompt_tokens is None:
+            prompt_tokens = count_message_tokens(messages) + count_tools_tokens(request.tools)
 
         if not analysed:
             signals = ComplexitySignals()

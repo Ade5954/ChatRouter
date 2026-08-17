@@ -162,6 +162,10 @@ class RequestContext:
     decision: RoutingDecision | None = None
     attempts: list[AttemptRecord] = field(default_factory=list)
     quota_downgraded: bool = False
+    # Prefix tokens observed by the router when it read the session's affinity
+    # binding. Cached here so the completion path can accumulate the new prompt
+    # without re-reading storage (one fewer round-trip per request).
+    affinity_prefix_tokens: int = 0
     # Set when the completion was served from the exact-match cache, so the API
     # layer can advertise it and the caller knows no fresh generation occurred.
     cache_hit: bool = False

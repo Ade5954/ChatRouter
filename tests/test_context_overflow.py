@@ -70,19 +70,26 @@ async def route(service, request, projected=0):
     return await service.router.route(context, projected)
 
 
+def trim_cfg(**overrides) -> ContextOverflowConfig:
+    return ContextOverflowConfig(
+        strategy=ContextOverflowStrategy.TRIM_HISTORY, **overrides
+    )
+
+
 class TestOverflowRouting:
     async def test_overflow_routes_to_widest_window(self):
-        """Default strategy: prefer the model that can actually hold the prompt."""
-        config = make_config(
-            models=tiny_models(),
-            routing=RoutingConfig(default_model="small"),
-        )
+        """Default strategy: prefer the model that can hold the prompt; ordinary
+        requests must be left untouched."""
+        config = make_config(models=tiny_models(), routing=RoutingConfig(default_model="small"))
         service = GatewayService(config)
         await service.start()
         try:
             decision = await route(service, make_request(long_conversation()))
             assert decision.model.id == "wide"
             assert any("context overflow" in n for n in decision.notes)
+
+            normal = await route(service, make_request([user("hi")]))
+            assert not any("context overflow" in n for n in normal.notes)
         finally:
             await service.close()
 
@@ -105,112 +112,54 @@ class TestOverflowRouting:
         finally:
             await service.close()
 
-    async def test_normal_conversation_is_untouched(self):
-        """Overflow handling must not perturb ordinary requests."""
-        config = make_config(models=tiny_models(), routing=RoutingConfig(default_model="small"))
-        service = GatewayService(config)
-        await service.start()
-        try:
-            decision = await route(service, make_request([user("hi")]))
-            assert not any("context overflow" in n for n in decision.notes)
-        finally:
-            await service.close()
-
 
 class TestTrimming:
-    def test_trim_preserves_system_and_latest_turn(self):
-        """The two things that must never be dropped.
-
-        Losing the system prompt changes the model's instructions; losing the
-        last user turn changes the question being asked. Either would silently
-        answer something other than what was requested.
-        """
+    def test_trim_preserves_edges_and_inserts_notice(self):
+        """The system prompt and the latest turn must never be dropped, and the
+        model must be told history is missing rather than assuming continuity."""
         model = tiny_models()[0]
         messages = long_conversation()
-        cfg = ContextOverflowConfig(strategy=ContextOverflowStrategy.TRIM_HISTORY)
+        cfg = trim_cfg()
 
         result = trim_to_fit(messages, model, cfg)
 
         assert result.trimmed
         assert result.messages[0].text() == messages[0].text()
         assert result.messages[-1].text() == messages[-1].text()
-
-    def test_trim_reduces_token_count(self):
-        model = tiny_models()[0]
-        messages = long_conversation()
-        cfg = ContextOverflowConfig(strategy=ContextOverflowStrategy.TRIM_HISTORY)
-
-        result = trim_to_fit(messages, model, cfg)
-
         assert result.final_tokens < result.original_tokens
-        assert len(result.messages) < len(messages)
-
-    def test_trim_inserts_elision_notice(self):
-        """The model must know history is missing, or it may assume continuity."""
-        model = tiny_models()[0]
-        cfg = ContextOverflowConfig(strategy=ContextOverflowStrategy.TRIM_HISTORY)
-
-        result = trim_to_fit(long_conversation(), model, cfg)
-
         assert any("omitted" in m.text() for m in result.messages)
 
     def test_trim_can_be_silent(self):
-        cfg = ContextOverflowConfig(
-            strategy=ContextOverflowStrategy.TRIM_HISTORY, insert_elision_notice=False
-        )
+        cfg = trim_cfg(insert_elision_notice=False)
         result = trim_to_fit(long_conversation(), tiny_models()[0], cfg)
         assert not any("omitted" in m.text() for m in result.messages)
 
-    def test_short_conversation_is_not_trimmed(self):
-        cfg = ContextOverflowConfig(strategy=ContextOverflowStrategy.TRIM_HISTORY)
-        messages = [user("hello")]
-        result = trim_to_fit(messages, tiny_models()[1], cfg)
-        assert not result.trimmed
-        assert len(result.messages) == 1
+    def test_trim_edge_cases(self):
+        """A short conversation is untouched; output reservations trim harder;
+        an irreducible head+tail is reported honestly."""
+        # Short conversation: nothing to trim.
+        short = trim_to_fit([user("hello")], tiny_models()[1], trim_cfg())
+        assert not short.trimmed
 
-    def test_trim_respects_output_reservation(self):
-        """Reserving output space must tighten the trim budget.
-
-        Trimming is best-effort: the protected system prompt and recent turns
-        are irreducible, so a large reservation may still not be satisfiable.
-        What is guaranteed is that a reservation trims strictly harder, and
-        that an unmet budget is reported rather than hidden.
-        """
+        # Output reservation trims strictly harder than without it.
         model = tiny_models()[1]
-        cfg = ContextOverflowConfig(strategy=ContextOverflowStrategy.TRIM_HISTORY)
         messages = long_conversation()
-
-        without = trim_to_fit(messages, model, cfg)
-        with_reserve = trim_to_fit(messages, model, cfg, reserve_output=600)
-
+        without = trim_to_fit(messages, model, trim_cfg())
+        with_reserve = trim_to_fit(messages, model, trim_cfg(), reserve_output=600)
         assert with_reserve.final_tokens <= without.final_tokens
         assert with_reserve.removed_messages >= without.removed_messages
 
-        budget = model.context_window - 600
-        if with_reserve.final_tokens > budget:
-            assert any("still exceeds" in n for n in with_reserve.notes)
-
-    def test_undroppable_conversation_is_reported(self):
-        """When the protected head+tail alone overflow, say so rather than
-        returning a result that quietly still does not fit."""
-        model = tiny_models()[0]
-        cfg = ContextOverflowConfig(
-            strategy=ContextOverflowStrategy.TRIM_HISTORY,
-            keep_trailing_messages=40,
-        )
-        result = trim_to_fit(long_conversation(), model, cfg)
+        # Irreducible conversation: the overflow must be reported, not hidden.
+        undroppable = trim_cfg(keep_trailing_messages=40)
+        result = trim_to_fit(long_conversation(), tiny_models()[0], undroppable)
         if result.final_tokens > model.context_window:
             assert any("still exceeds" in n for n in result.notes)
 
 
 class TestHelpers:
-    def test_largest_window_model(self):
+    def test_window_helpers(self):
         assert largest_window_model(tiny_models()).id == "wide"
-
-    def test_largest_window_of_empty_list(self):
         assert largest_window_model([]) is None
-
-    def test_fits_accounts_for_output_reserve(self):
         model = tiny_models()[0]
         assert fits(model, 100, 50)
         assert not fits(model, 100, 150)

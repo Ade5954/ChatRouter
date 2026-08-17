@@ -12,6 +12,7 @@ exactly once, including on failure paths.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -127,8 +128,13 @@ class GatewayService:
         )
         bind_request_context(request_id=request_id, tenant=tenant.id)
 
-        prompt_tokens, projected_tokens = estimate_request_tokens(
-            request.messages, request.tools, request.requested_max_tokens
+        # Token estimation is CPU-heavy (tiktoken + per-message heuristics);
+        # run it off the event loop so it cannot block concurrent requests.
+        prompt_tokens, projected_tokens = await asyncio.to_thread(
+            estimate_request_tokens,
+            request.messages,
+            request.tools,
+            request.requested_max_tokens,
         )
 
         headers: dict[str, str] = {"x-chatrouter-request-id": request_id}
@@ -162,7 +168,9 @@ class GatewayService:
                 logger.warning("tenant quota exhausted, downgrading", reason=quota_verdict.reason)
 
             # --- routing --------------------------------------------------------
-            decision = await self.router.route(context, projected_tokens)
+            decision = await self.router.route(
+                context, projected_tokens, prompt_tokens=prompt_tokens
+            )
             context.decision = decision
             headers["x-chatrouter-model"] = decision.model.id
             headers["x-chatrouter-routing-reason"] = decision.reason.value
@@ -194,7 +202,15 @@ class GatewayService:
     async def complete(
         self, context: RequestContext, projected_tokens: int
     ) -> tuple[dict[str, Any], DispatchResult]:
-        """Serve a non-streaming completion, short-circuiting on a cache hit."""
+        """Serve a non-streaming completion, short-circuiting on a cache hit.
+
+        Accounting (quota, feedback learning, session affinity, cache
+        write-through) is *not* awaited here: the response body is returned to
+        the caller as soon as the upstream completes and the concurrency slot
+        is released, and the accounting runs as a background task afterwards.
+        Failure accounting stays synchronous so error responses carry complete
+        state.
+        """
         tenant = context.tenant
         cache = self.response_cache
         decision = context.decision
@@ -212,13 +228,8 @@ class GatewayService:
                 cached_model = self.config.model_by_id(cached_model_id) or model
                 result = self._result_from_cache(context, cached_model, payload, projected_tokens)
                 metrics.CACHE_HITS.labels(tenant=tenant.id, model=cached_model.id).inc()
-                # Accounting still runs on a hit: quota, billing and the feedback
-                # loop must see the request even though no upstream call happened.
-                try:
-                    await self._finalise_success(context, result, projected_tokens)
-                finally:
-                    await self.rate_limiter.release(tenant)
                 context.cache_hit = True
+                await self.rate_limiter.release(tenant)
                 return result.payload, result
 
             metrics.CACHE_MISSES.labels(tenant=tenant.id, model=model.id, reason="miss").inc()
@@ -236,37 +247,12 @@ class GatewayService:
             result = await self.dispatcher.dispatch(context, projected_tokens)
         except ChatRouterError as exc:
             await self._finalise_failure(context, projected_tokens, exc)
-            raise
-        finally:
             await self.rate_limiter.release(tenant)
+            raise
 
-        await self._finalise_success(context, result, projected_tokens)
-
-        # Write-through: a clean success becomes a cache entry for the exact
-        # request that produced it.
-        if (
-            cache.should_participate(context.request, tenant)
-            and decision is not None
-            and result.completion_tokens > 0
-        ):
-            affinity_ttl: int | None = None
-            if (
-                self.config.routing.session_affinity.enabled
-                and context.session_id
-                and cache._config.affinity_aware
-            ):
-                # Cap the cache entry at the remaining affinity binding so a
-                # cached answer can never outlive the model the session is pinned
-                # to (which would otherwise serve a stale model's response).
-                affinity_ttl = await self.storage.session_affinity_ttl(context.session_id)
-            await cache.put(
-                cache.key_for(context.request, model),
-                result.payload,
-                model.id,
-                affinity_ttl_seconds=affinity_ttl,
-            )
-            metrics.CACHE_STORED.labels(tenant=tenant.id, model=model.id).inc()
-
+        # The slot is released synchronously so concurrency limits stay exact;
+        # the rest of the accounting happens in the response's background task.
+        await self.rate_limiter.release(tenant)
         return result.payload, result
 
     def _result_from_cache(
@@ -308,22 +294,92 @@ class GatewayService:
     async def stream(
         self, context: RequestContext, projected_tokens: int
     ) -> AsyncIterator[bytes]:
-        """Serve a streaming completion, accounting once the stream ends."""
+        """Serve a streaming completion, accounting once the stream ends.
+
+        The accounting itself runs as a background task attached to the
+        ``StreamingResponse``: ``_finalise_stream`` already no-ops when the
+        stream failed before any successful attempt, so the background task
+        only needs to inspect the attempts recorded by the dispatcher.
+        """
         tenant = context.tenant
-        succeeded = False
         try:
             async for chunk in self.dispatcher.dispatch_stream(context, projected_tokens):
                 yield chunk
-            succeeded = True
         except ChatRouterError as exc:
             await self._finalise_failure(context, projected_tokens, exc)
             raise
         finally:
             await self.rate_limiter.release(tenant)
-            if succeeded:
-                await self._finalise_stream(context, projected_tokens)
 
     # -- accounting and learning -------------------------------------------------
+
+    async def _finalise_success_bg(
+        self, context: RequestContext, result: DispatchResult, projected_tokens: int
+    ) -> None:
+        """Run post-response accounting in the background.
+
+        Invoked from the response's ``BackgroundTask`` after the body has been
+        sent, so the client is never kept waiting for the quota/feedback
+        bookkeeping. Failures here must not surface to the client — the
+        response is already committed — so they are logged and swallowed.
+        """
+        bind_request_context(request_id=context.request_id, tenant=context.tenant.id)
+        try:
+            await self._finalise_success(context, result, projected_tokens)
+            await self._maybe_cache_result(context, result, projected_tokens)
+        except Exception:
+            logger.exception("background accounting failed", request_id=context.request_id)
+        finally:
+            clear_request_context()
+
+    async def _finalise_stream_bg(
+        self, context: RequestContext, projected_tokens: int
+    ) -> None:
+        """Background counterpart of :meth:`_finalise_stream`.
+
+        ``_finalise_stream`` itself already no-ops when no attempt succeeded
+        (the stream failed before any bytes, or the client disconnected), so
+        the background task never needs to know how the stream ended.
+        """
+        bind_request_context(request_id=context.request_id, tenant=context.tenant.id)
+        try:
+            await self._finalise_stream(context, projected_tokens)
+        except Exception:
+            logger.exception("background stream accounting failed", request_id=context.request_id)
+        finally:
+            clear_request_context()
+
+    async def _maybe_cache_result(
+        self, context: RequestContext, result: DispatchResult, projected_tokens: int
+    ) -> None:
+        """Write-through a clean success into the exact-match response cache."""
+        cache = self.response_cache
+        decision = context.decision
+        if (
+            context.cache_hit
+            or decision is None
+            or result.completion_tokens <= 0
+            or not cache.should_participate(context.request, context.tenant)
+        ):
+            return
+
+        affinity_ttl: int | None = None
+        if (
+            self.config.routing.session_affinity.enabled
+            and context.session_id
+            and cache._config.affinity_aware
+        ):
+            # Cap the cache entry at the remaining affinity binding so a
+            # cached answer can never outlive the model the session is pinned
+            # to (which would otherwise serve a stale model's response).
+            affinity_ttl = await self.storage.session_affinity_ttl(context.session_id)
+        await cache.put(
+            cache.key_for(context.request, decision.model),
+            result.payload,
+            decision.model.id,
+            affinity_ttl_seconds=affinity_ttl,
+        )
+        metrics.CACHE_STORED.labels(tenant=context.tenant.id, model=decision.model.id).inc()
 
     async def _finalise_success(
         self, context: RequestContext, result: DispatchResult, projected_tokens: int
@@ -464,8 +520,10 @@ class GatewayService:
             RoutingDecisionReason.EXPLICIT_MODEL,
         ):
             return
-        existing = await self.storage.get_session_affinity(context.session_id)
-        prev = existing.prefix_tokens if existing is not None else 0
+        # The router already read this session's binding for the routing
+        # decision; reuse its prefix instead of re-reading storage (one fewer
+        # round-trip per request).
+        prev = context.affinity_prefix_tokens
         model = self.config.model_by_id(model_id)
         cap = model.context_window if model is not None else 0
         new_prefix = prev + max(0, int(prompt_tokens))
@@ -671,10 +729,10 @@ class GatewayService:
         context = RequestContext(
             request_id=new_request_id(), tenant=tenant, request=request
         )
-        _, projected = estimate_request_tokens(
-            request.messages, request.tools, request.requested_max_tokens
+        prompt, projected = await asyncio.to_thread(
+            estimate_request_tokens, request.messages, request.tools, request.requested_max_tokens
         )
-        decision = await self.router.route(context, projected)
+        decision = await self.router.route(context, projected, prompt_tokens=prompt)
         return {
             "request_id": context.request_id,
             "tenant": tenant.id,

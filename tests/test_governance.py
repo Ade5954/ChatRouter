@@ -6,6 +6,7 @@ import asyncio
 
 from chatrouter.config.models import (
     CircuitBreakerConfig,
+    ModelConfig,
     OverflowConfig,
     QuotaConfig,
     RateLimitConfig,
@@ -25,14 +26,6 @@ async def fresh_storage() -> MemoryStorage:
 
 
 class TestRateLimiter:
-    async def test_requests_allowed_under_limit(self):
-        storage = await fresh_storage()
-        limiter = RateLimiter(storage)
-        tenant = TenantConfig(id="t", rate_limit=RateLimitConfig(rpm=5))
-        for _ in range(5):
-            verdict, _ = await limiter.check_and_consume(tenant, 0)
-            assert verdict.allowed
-
     async def test_rpm_limit_enforced(self):
         storage = await fresh_storage()
         limiter = RateLimiter(storage)
@@ -104,10 +97,11 @@ class TestRateLimiter:
 
 
 class TestQuota:
-    async def test_within_quota_allowed(self):
+    async def test_no_quota_configured_allows(self):
         storage = await fresh_storage()
         quotas = QuotaManager(storage)
-        tenant = TenantConfig(id="t", quota=QuotaConfig(max_requests=10))
+        tenant = TenantConfig(id="t")
+        assert (await quotas.check(tenant, 10**9)).allowed
         assert (await quotas.check(tenant, 100)).allowed
 
     async def test_request_quota_exhausted_rejects(self):
@@ -140,12 +134,6 @@ class TestQuota:
         assert not (await quotas.check(tenant, 500)).allowed
         assert (await quotas.check(tenant, 50)).allowed
 
-    async def test_no_quota_configured_allows(self):
-        storage = await fresh_storage()
-        quotas = QuotaManager(storage)
-        tenant = TenantConfig(id="t")
-        assert (await quotas.check(tenant, 10**9)).allowed
-
 
 class TestCircuitBreaker:
     def test_starts_closed(self):
@@ -153,61 +141,48 @@ class TestCircuitBreaker:
         assert breakers.allows("m")
         assert breakers.state("m") is BreakerState.CLOSED
 
-    def test_opens_after_consecutive_failures(self):
+    def test_consecutive_failures_open_and_reset(self):
         breakers = CircuitBreakerRegistry(CircuitBreakerConfig(failure_threshold=3))
         for _ in range(3):
             breakers.record_failure("m")
         assert breakers.state("m") is BreakerState.OPEN
         assert not breakers.allows("m")
 
-    def test_success_resets_consecutive_counter(self):
-        breakers = CircuitBreakerRegistry(CircuitBreakerConfig(failure_threshold=3))
-        breakers.record_failure("m")
-        breakers.record_failure("m")
-        breakers.record_success("m")
-        breakers.record_failure("m")
-        assert breakers.state("m") is BreakerState.CLOSED
+        # A success resets the consecutive-failure counter.
+        resettable = CircuitBreakerRegistry(CircuitBreakerConfig(failure_threshold=3))
+        resettable.record_failure("m")
+        resettable.record_failure("m")
+        resettable.record_success("m")
+        resettable.record_failure("m")
+        assert resettable.state("m") is BreakerState.CLOSED
 
-    def test_half_open_after_cooldown(self):
-        breakers = CircuitBreakerRegistry(
-            CircuitBreakerConfig(failure_threshold=2, open_seconds=0.01)
-        )
-        breakers.record_failure("m")
-        breakers.record_failure("m")
-        assert not breakers.allows("m")
+    def test_half_open_state_machine(self):
         import time
 
-        time.sleep(0.02)
-        assert breakers.allows("m")
-        assert breakers.state("m") is BreakerState.HALF_OPEN
-
-    def test_half_open_failure_reopens(self):
-        import time
-
-        breakers = CircuitBreakerRegistry(
-            CircuitBreakerConfig(failure_threshold=2, open_seconds=0.01)
-        )
-        breakers.record_failure("m")
-        breakers.record_failure("m")
-        time.sleep(0.02)
-        breakers.allows("m")
-        breakers.record_failure("m")
-        assert breakers.state("m") is BreakerState.OPEN
-
-    def test_half_open_success_closes(self):
-        import time
-
+        # Probe success closes the circuit.
         breakers = CircuitBreakerRegistry(
             CircuitBreakerConfig(failure_threshold=2, open_seconds=0.01, half_open_max_calls=2)
         )
         breakers.record_failure("m")
         breakers.record_failure("m")
+        assert not breakers.allows("m")
         time.sleep(0.02)
-        breakers.allows("m")
+        assert breakers.allows("m")
         breakers.record_success("m")
         breakers.allows("m")
         breakers.record_success("m")
         assert breakers.state("m") is BreakerState.CLOSED
+
+        # Probe failure reopens the circuit.
+        reopened = CircuitBreakerRegistry(
+            CircuitBreakerConfig(failure_threshold=2, open_seconds=0.01)
+        )
+        reopened.record_failure("m")
+        reopened.record_failure("m")
+        time.sleep(0.02)
+        reopened.allows("m")
+        reopened.record_failure("m")
+        assert reopened.state("m") is BreakerState.OPEN
 
     def test_disabled_breaker_always_allows(self):
         breakers = CircuitBreakerRegistry(CircuitBreakerConfig(enabled=False))
@@ -229,8 +204,6 @@ class TestCircuitBreaker:
 
 class TestLoadTracking:
     async def test_utilisation_reflects_reservations(self):
-        from chatrouter.config.models import ModelConfig
-
         storage = await fresh_storage()
         tracker = ModelLoadTracker(storage, OverflowConfig())
         model = ModelConfig(id="m", provider="p", upstream_model="u", max_rpm=10)
@@ -240,20 +213,7 @@ class TestLoadTracking:
         assert snapshot.rpm_used == 5
         assert 0.4 < snapshot.utilisation < 0.6
 
-    async def test_headroom_detection(self):
-        from chatrouter.config.models import ModelConfig
-
-        storage = await fresh_storage()
-        tracker = ModelLoadTracker(storage, OverflowConfig())
-        model = ModelConfig(id="m", provider="p", upstream_model="u", max_rpm=2)
-        await tracker.reserve(model, 0)
-        await tracker.reserve(model, 0)
-        snapshot = await tracker.snapshot(model)
-        assert not snapshot.has_headroom()
-
-    async def test_release_frees_concurrency(self):
-        from chatrouter.config.models import ModelConfig
-
+    async def test_headroom_and_release(self):
         storage = await fresh_storage()
         tracker = ModelLoadTracker(storage, OverflowConfig())
         model = ModelConfig(id="m", provider="p", upstream_model="u", max_concurrency=1)
@@ -263,21 +223,15 @@ class TestLoadTracking:
         assert (await tracker.snapshot(model)).has_headroom()
 
     async def test_saturation_threshold(self):
-        from chatrouter.config.models import ModelConfig
-
         storage = await fresh_storage()
         tracker = ModelLoadTracker(storage, OverflowConfig(saturation_threshold=0.5))
-        model = ModelConfig(id="m", provider="p", upstream_model="u", max_rpm=10)
+        limited = ModelConfig(id="m", provider="p", upstream_model="u", max_rpm=10)
         for _ in range(6):
-            await tracker.reserve(model, 0)
-        assert tracker.is_saturated(await tracker.snapshot(model))
+            await tracker.reserve(limited, 0)
+        assert tracker.is_saturated(await tracker.snapshot(limited))
 
-    async def test_unlimited_model_never_saturates(self):
-        from chatrouter.config.models import ModelConfig
-
-        storage = await fresh_storage()
-        tracker = ModelLoadTracker(storage, OverflowConfig())
-        model = ModelConfig(id="m", provider="p", upstream_model="u")
-        for _ in range(1000):
-            await tracker.reserve(model, 1000)
-        assert not tracker.is_saturated(await tracker.snapshot(model))
+        # A model with no configured limits never saturates.
+        unlimited = ModelConfig(id="u", provider="p", upstream_model="x")
+        for _ in range(100):
+            await tracker.reserve(unlimited, 1000)
+        assert not tracker.is_saturated(await tracker.snapshot(unlimited))

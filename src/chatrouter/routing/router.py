@@ -13,6 +13,7 @@ Decision flow for one request:
 
 from __future__ import annotations
 
+import asyncio
 import random
 
 from ..config.models import (
@@ -85,12 +86,24 @@ class Router:
     def models(self) -> list[ModelConfig]:
         return self._models
 
-    def analyse(self, request: ChatCompletionRequest) -> ComplexityAssessment:
-        """Expose the complexity assessment (used by the explain endpoint)."""
-        window_hint = max((m.context_window for m in self._models), default=128_000)
-        return self._analyzer.analyse(request, window_hint)
+    def analyse(
+        self, request: ChatCompletionRequest, prompt_tokens: int | None = None
+    ) -> ComplexityAssessment:
+        """Expose the complexity assessment (used by the explain endpoint).
 
-    async def route(self, context: RequestContext, projected_tokens: int = 0) -> RoutingDecision:
+        ``prompt_tokens`` may be passed in to reuse the token count already
+        computed by the gateway's prepare stage instead of tokenising the
+        conversation a second time.
+        """
+        window_hint = max((m.context_window for m in self._models), default=128_000)
+        return self._analyzer.analyse(request, window_hint, prompt_tokens=prompt_tokens)
+
+    async def route(
+        self,
+        context: RequestContext,
+        projected_tokens: int = 0,
+        prompt_tokens: int | None = None,
+    ) -> RoutingDecision:
         """Produce a routing decision for the given request."""
         request = context.request
         tenant = context.tenant
@@ -128,7 +141,10 @@ class Router:
                     raise ModelNotFoundError(f"model '{requested}' does not exist")
 
         # --- 2. Complexity assessment --------------------------------------
-        assessment = self.analyse(request)
+        # Tokenisation plus the regex signal scan is the hottest CPU path in
+        # the gateway; run it off the event loop so long conversations cannot
+        # stall concurrent requests under the GIL.
+        assessment = await asyncio.to_thread(self.analyse, request, prompt_tokens)
         target_tier = assessment.tier
         notes: list[str] = list(assessment.explanation)
 
@@ -171,6 +187,9 @@ class Router:
             if binding is not None:
                 affinity_model_id = binding.model_id
                 affinity_prefix_tokens = binding.prefix_tokens
+                # Remember the prefix on the context so the completion path can
+                # accumulate the new prompt without reading storage again.
+                context.affinity_prefix_tokens = affinity_prefix_tokens
 
         # --- 4. Scoring -------------------------------------------------------
         scored = await self._score_candidates(
@@ -462,16 +481,28 @@ class Router:
                     _MAX_AFFINITY_PENALTY,
                 ) * stickiness
 
-        candidates: list[ScoredCandidate] = []
-        for model in models:
-            distance = model.tier.rank - target_tier.rank
-            # Tiers below the target risk quality; tiers above waste money.
-            if distance < 0 and not self._routing.allow_downgrade:
-                continue
-            if distance > 0 and not self._routing.allow_upgrade:
-                continue
+        # Fetch per-model feedback stats concurrently: each read is a storage
+        # round-trip, so sequential awaits would add N × RTT to every request.
+        distances = {m.id: m.tier.rank - target_tier.rank for m in models}
+        eligible = [
+            m
+            for m in models
+            if not (distances[m.id] < 0 and not self._routing.allow_downgrade)
+            and not (distances[m.id] > 0 and not self._routing.allow_upgrade)
+        ]
+        stats_by_model = dict(
+            zip(
+                (m.id for m in eligible),
+                await asyncio.gather(
+                    *(self._feedback.get_stats(m.id, target_tier) for m in eligible)
+                ),
+            )
+        )
 
-            stats = await self._feedback.get_stats(model.id, target_tier)
+        candidates: list[ScoredCandidate] = []
+        for model in eligible:
+            distance = distances[model.id]
+            stats = stats_by_model[model.id]
             quality = self._feedback.effective_quality(model.quality_prior, stats)
 
             cost_score = 1.0 - min(1.0, model.avg_cost_per_1k / _COST_CEILING)

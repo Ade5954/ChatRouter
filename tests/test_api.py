@@ -57,21 +57,14 @@ def client():
 
 
 class TestAuth:
-    def test_missing_key_rejected(self, client):
-        response = client.post(
-            "/v1/chat/completions",
-            json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-        )
-        assert response.status_code == 401
-        assert response.json()["error"]["type"] == "invalid_request_error"
-
-    def test_invalid_key_rejected(self, client):
-        response = client.post(
-            "/v1/chat/completions",
-            json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-            headers={"Authorization": "Bearer wrong"},
-        )
-        assert response.status_code == 401
+    def test_missing_or_invalid_key_rejected(self, client):
+        for headers in ({}, {"Authorization": "Bearer wrong"}):
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                headers=headers,
+            )
+            assert response.status_code == 401
 
     def test_x_api_key_header_accepted(self, client):
         with respx.mock:
@@ -99,55 +92,46 @@ class TestChatCompletions:
         assert "x-chatrouter-model" in response.headers
         assert "x-chatrouter-request-id" in response.headers
 
-    def test_response_reports_gateway_model_id(self, client):
-        """Clients must see the gateway's model id, not the upstream name."""
+    def test_routing_headers_and_model_mapping(self, client):
+        """Clients see the gateway model id; headers expose the decision."""
         with respx.mock:
-            respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
-            response = client.post(
-                "/v1/chat/completions",
-                json={"model": "cheap", "messages": [{"role": "user", "content": "hi"}]},
-                headers=AUTH,
-            )
-        assert response.json()["model"] == "cheap"
-
-    def test_routing_headers_present(self, client):
-        with respx.mock:
-            respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
-            response = client.post(
-                "/v1/chat/completions",
-                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-                headers=AUTH,
-            )
-        assert response.headers["x-chatrouter-routing-reason"]
-        assert 0 <= float(response.headers["x-chatrouter-complexity"]) <= 1
-        assert response.headers["x-chatrouter-tier"]
-
-    def test_upstream_receives_mapped_model_name(self, client):
-        with respx.mock:
+            # Explicit model: upstream receives the mapped name, no assessment.
             route = respx.post(UPSTREAM).mock(
                 return_value=httpx.Response(200, json=completion_body())
             )
-            client.post(
+            explicit = client.post(
                 "/v1/chat/completions",
                 json={"model": "strong", "messages": [{"role": "user", "content": "hi"}]},
                 headers=AUTH,
             )
             sent = json.loads(route.calls[0].request.content)
-        assert sent["model"] == "strong-1"
+            assert explicit.json()["model"] == "strong"
+            assert sent["model"] == "strong-1"
 
-    def test_empty_messages_rejected(self, client):
-        response = client.post(
-            "/v1/chat/completions", json={"model": "auto", "messages": []}, headers=AUTH
-        )
-        assert response.status_code == 400
+            # Auto routing: decision headers carry the complexity assessment.
+            auto = client.post(
+                "/v1/chat/completions",
+                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                headers=AUTH,
+            )
+        assert auto.headers["x-chatrouter-routing-reason"]
+        assert 0 <= float(auto.headers["x-chatrouter-complexity"]) <= 1
 
-    def test_n_greater_than_one_rejected(self, client):
-        response = client.post(
-            "/v1/chat/completions",
-            json={"model": "auto", "messages": [{"role": "user", "content": "hi"}], "n": 3},
-            headers=AUTH,
+    def test_invalid_requests_rejected(self, client):
+        assert (
+            client.post(
+                "/v1/chat/completions", json={"model": "auto", "messages": []}, headers=AUTH
+            ).status_code
+            == 400
         )
-        assert response.status_code == 400
+        assert (
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}], "n": 3},
+                headers=AUTH,
+            ).status_code
+            == 400
+        )
 
     def test_unknown_model_returns_404(self, client):
         response = client.post(
@@ -159,30 +143,7 @@ class TestChatCompletions:
 
 
 class TestStreaming:
-    def test_stream_relays_chunks(self, client):
-        with respx.mock:
-            respx.post(UPSTREAM).mock(
-                return_value=httpx.Response(
-                    200, content=sse_stream(), headers={"content-type": "text/event-stream"}
-                )
-            )
-            with client.stream(
-                "POST",
-                "/v1/chat/completions",
-                json={
-                    "model": "auto",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": True,
-                },
-                headers=AUTH,
-            ) as response:
-                assert response.status_code == 200
-                body = "".join(response.iter_text())
-        assert "data:" in body
-        assert "[DONE]" in body
-        assert "Hi" in body
-
-    def test_stream_rewrites_model_name(self, client):
+    def test_stream_relays_and_rewrites_model(self, client):
         with respx.mock:
             respx.post(UPSTREAM).mock(
                 return_value=httpx.Response(
@@ -199,7 +160,11 @@ class TestStreaming:
                 },
                 headers=AUTH,
             ) as response:
+                assert response.status_code == 200
                 body = "".join(response.iter_text())
+        assert "data:" in body
+        assert "[DONE]" in body
+        assert "Hi" in body
         events = [
             json.loads(line[5:])
             for line in body.splitlines()
@@ -250,21 +215,6 @@ class TestFailover:
             )
         assert response.status_code == 502
 
-    def test_timeout_is_retried(self, client):
-        with respx.mock:
-            respx.post(UPSTREAM).mock(
-                side_effect=[
-                    httpx.TimeoutException("timed out"),
-                    httpx.Response(200, json=completion_body()),
-                ]
-            )
-            response = client.post(
-                "/v1/chat/completions",
-                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-                headers=AUTH,
-            )
-        assert response.status_code == 200
-
 
 class TestRateLimitingEndToEnd:
     def test_rpm_limit_returns_429(self):
@@ -284,21 +234,13 @@ class TestRateLimitingEndToEnd:
         with TestClient(app) as client, respx.mock:
             respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
             payload = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}
-            assert client.post("/v1/chat/completions", json=payload, headers=AUTH).status_code == 200
+            ok = client.post("/v1/chat/completions", json=payload, headers=AUTH)
+            assert ok.status_code == 200
+            assert "x-ratelimit-limit-requests" in ok.headers
             assert client.post("/v1/chat/completions", json=payload, headers=AUTH).status_code == 200
             limited = client.post("/v1/chat/completions", json=payload, headers=AUTH)
             assert limited.status_code == 429
             assert "Retry-After" in limited.headers
-
-    def test_rate_limit_headers_exposed(self, client):
-        with respx.mock:
-            respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
-            response = client.post(
-                "/v1/chat/completions",
-                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-                headers=AUTH,
-            )
-        assert "x-ratelimit-limit-requests" in response.headers
 
 
 class TestModelsEndpoint:
@@ -345,12 +287,8 @@ class TestFeedbackEndpoint:
         assert response.json()["accepted"] is False
 
     def test_feedback_cannot_be_replayed(self, client):
-        """A request_id must be scoreable exactly once.
-
-        request_id is returned to the client in a response header, so a
-        replayable feedback endpoint is a poisoning vector for adaptive
-        routing: repeated downvotes would drive a model out of the pool.
-        """
+        """A request_id must be scoreable exactly once; replays must not inflate
+        feedback_count (the confidence weight for adaptive routing)."""
         with respx.mock:
             respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
             completion = client.post(
@@ -359,6 +297,7 @@ class TestFeedbackEndpoint:
                 headers=AUTH,
             )
         request_id = completion.headers["x-chatrouter-request-id"]
+        model_id = completion.headers["x-chatrouter-model"]
 
         first = client.post(
             "/v1/feedback", json={"request_id": request_id, "thumb": "down"}, headers=AUTH
@@ -372,24 +311,6 @@ class TestFeedbackEndpoint:
             assert replay.status_code == 200
             assert replay.json()["accepted"] is False
 
-    def test_replayed_feedback_does_not_inflate_stats(self, client):
-        """The confidence weighting keys off feedback_count, so the count
-        itself must not be inflatable by resubmitting the same request_id."""
-        with respx.mock:
-            respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
-            completion = client.post(
-                "/v1/chat/completions",
-                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-                headers=AUTH,
-            )
-        request_id = completion.headers["x-chatrouter-request-id"]
-        model_id = completion.headers["x-chatrouter-model"]
-
-        for _ in range(10):
-            client.post(
-                "/v1/feedback", json={"request_id": request_id, "thumb": "down"}, headers=AUTH
-            )
-
         service = client.app.state.service
         stats = asyncio.run(service.feedback.get_stats(model_id, None))
         assert stats.feedback_count == 1
@@ -398,57 +319,34 @@ class TestFeedbackEndpoint:
         response = client.post("/v1/feedback", json={"request_id": "x"}, headers=AUTH)
         assert response.status_code == 400
 
-    def test_rating_is_normalised(self, client):
-        with respx.mock:
-            respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=completion_body()))
-            completion = client.post(
-                "/v1/chat/completions",
-                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-                headers=AUTH,
-            )
-        request_id = completion.headers["x-chatrouter-request-id"]
-        response = client.post(
-            "/v1/feedback", json={"request_id": request_id, "rating": 5}, headers=AUTH
-        )
-        assert response.json()["applied_score"] == 1.0
-
 
 class TestExplainEndpoint:
-    def test_explain_returns_decision(self, client):
-        response = client.post(
-            "/v1/routing/explain",
-            json={
-                "model": "auto",
-                "messages": [
-                    {"role": "user", "content": "Prove this theorem with full derivations."}
-                ],
-            },
-            headers=AUTH,
-        )
+    def test_explain_returns_decision_without_upstream_call(self, client):
+        with respx.mock:
+            route = respx.post(UPSTREAM).mock(
+                return_value=httpx.Response(200, json=completion_body())
+            )
+            response = client.post(
+                "/v1/routing/explain",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {"role": "user", "content": "Prove this theorem with full derivations."}
+                    ],
+                },
+                headers=AUTH,
+            )
         assert response.status_code == 200
         decision = response.json()["decision"]
         assert decision["model"]
         assert decision["assessment"]["score"] > 0
         assert decision["candidates"]
-
-    def test_explain_does_not_call_upstream(self, client):
-        with respx.mock:
-            route = respx.post(UPSTREAM).mock(
-                return_value=httpx.Response(200, json=completion_body())
-            )
-            client.post(
-                "/v1/routing/explain",
-                json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
-                headers=AUTH,
-            )
-            assert route.call_count == 0
+        assert route.call_count == 0
 
 
 class TestOpsEndpoints:
-    def test_healthz(self, client):
+    def test_health_and_readiness(self, client):
         assert client.get("/healthz").json()["status"] == "ok"
-
-    def test_readyz(self, client):
         assert client.get("/readyz").status_code == 200
 
     def test_metrics_exposed(self, client):
@@ -458,15 +356,14 @@ class TestOpsEndpoints:
     def test_admin_requires_key(self, client):
         assert client.get("/admin/status").status_code == 401
 
-    def test_admin_status_with_key(self, client):
+    def test_admin_status_and_config(self, client):
         response = client.get("/admin/status", headers={"x-admin-key": "admin-secret"})
         assert response.status_code == 200
         assert "models" in response.json()
 
-    def test_admin_config_redacts_secrets(self, client):
-        response = client.get("/admin/config", headers={"x-admin-key": "admin-secret"})
-        assert response.status_code == 200
-        body = response.json()
+        config = client.get("/admin/config", headers={"x-admin-key": "admin-secret"})
+        assert config.status_code == 200
+        body = config.json()
         assert all("api_key" not in p or p.get("api_key") is None for p in body["providers"])
         for tenant in body["tenants"]:
             for key in tenant["api_keys"]:

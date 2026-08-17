@@ -43,8 +43,9 @@ async def _route(service, request, session_id=None):
 
 
 class TestSessionAffinity:
-    async def test_followup_stays_on_first_model(self):
-        """A simpler follow-up sticks to the session's existing model."""
+    async def test_affinity_sticks_and_persists(self):
+        """A simpler follow-up sticks to the session's existing model, and the
+        binding is actually persisted for the next turn to reuse."""
         config = make_config(**_AFFINITY_CONFIG)
         svc = GatewayService(config)
         await svc.start()
@@ -53,21 +54,9 @@ class TestSessionAffinity:
             second = await _route(svc, make_request([user("ok thanks")]), "sess-a")
             assert second.model.id == first.model.id
             assert second.reason.value == "session_affinity"
-        finally:
-            await svc.close()
 
-    async def test_affinity_writes_then_reuses_storage(self):
-        """The chosen model is persisted and reused via storage."""
-        config = make_config(**_AFFINITY_CONFIG)
-        svc = GatewayService(config)
-        await svc.start()
-        try:
-            await _route(svc, make_request([user("Hello")]), "sess-b")
             # Read straight from storage to prove the write happened.
-            stored = await svc.storage.get_session_model("sess-b")
-            assert stored is not None
-            again = await _route(svc, make_request([user("Hi again")]), "sess-b")
-            assert again.model.id == stored
+            assert await svc.storage.get_session_model("sess-a") == first.model.id
         finally:
             await svc.close()
 

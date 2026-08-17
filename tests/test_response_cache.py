@@ -8,6 +8,9 @@ indistinguishable from a real generation to the rest of the gateway.
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import httpx
 import pytest
 import respx
@@ -105,11 +108,11 @@ class TestResponseCache:
         assert second.headers["x-chatrouter-cache"] == "HIT"
         service = cached_client.app.state.service
         tenant = cached_client.app.state.config.tenants[0]
-        # Quota recorded for both requests: 2 * 20 tokens.
-        snap = _run(service.quotas.snapshot(tenant))
+        snap = asyncio.run(service.quotas.snapshot(tenant))
         assert snap["tokens"] == 40
 
-    def test_different_messages_miss(self, cached_client):
+    def test_different_requests_miss(self, cached_client):
+        """Different messages or sampling parameters must never collide."""
         calls = {"n": 0}
 
         def _mk(content):
@@ -121,30 +124,18 @@ class TestResponseCache:
 
         with respx.mock:
             respx.post(UPSTREAM).mock(
-                side_effect=[_mk("one"), _mk("two")]
+                side_effect=[_mk("one"), _mk("two"), _mk("t0"), _mk("t1")]
             )
             a = _ask(cached_client, content="alpha")
             b = _ask(cached_client, content="beta")
-        assert a.json()["choices"][0]["message"]["content"] == "one"
-        assert b.json()["choices"][0]["message"]["content"] == "two"
-        assert calls["n"] == 2
+            assert a.json()["choices"][0]["message"]["content"] == "one"
+            assert b.json()["choices"][0]["message"]["content"] == "two"
 
-    def test_different_temperature_miss(self, cached_client):
-        calls = {"n": 0}
-
-        def _mk(content):
-            def _c(_):
-                calls["n"] += 1
-                return httpx.Response(200, json=completion_body(content=content))
-
-            return _c
-
-        with respx.mock:
-            respx.post(UPSTREAM).mock(side_effect=[_mk("t0"), _mk("t1")])
-            _ask(cached_client, temperature=0.0)
-            other = _ask(cached_client, temperature=1.0)
-        assert other.json()["choices"][0]["message"]["content"] == "t1"
-        assert calls["n"] == 2
+            c = _ask(cached_client, temperature=0.0)
+            d = _ask(cached_client, temperature=1.0)
+            assert c.json()["choices"][0]["message"]["content"] == "t0"
+            assert d.json()["choices"][0]["message"]["content"] == "t1"
+        assert calls["n"] == 4
 
     def test_streaming_never_cached(self, cached_client):
         calls = {"n": 0}
@@ -194,66 +185,47 @@ class TestResponseCache:
         assert b.json()["choices"][0]["message"]["content"] == "s2"
         assert calls["n"] == 2
 
-    def test_session_affinity_aware_same_model_hits(self, cached_client):
-        """With affinity_aware on (default), an identical turn within a sticky
-        session reuses the cached answer — the two savings now stack."""
+    def test_session_affinity_scoped_keys(self, cached_client):
+        """Session-scoped keys: identical turns in one sticky session hit;
+        drifting to another model, or using another session, misses."""
         calls = {"n": 0}
 
-        def _count(_):
-            calls["n"] += 1
-            return httpx.Response(200, json=completion_body())
+        def _mk(content):
+            def _c(_):
+                calls["n"] += 1
+                return httpx.Response(200, json=completion_body(content=content))
+
+            return _c
 
         with respx.mock:
-            respx.post(UPSTREAM).mock(side_effect=_count)
+            respx.post(UPSTREAM).mock(
+                side_effect=[
+                    _mk("same-1"),
+                    _mk("cheap-ans"),
+                    _mk("reasoner-ans"),
+                    _mk("x1"),
+                    _mk("x2"),
+                ]
+            )
+            # Same session, identical turn -> cache hit on the second call.
             first = _ask(cached_client, chatrouter={"session_id": "sess-a"})
             assert first.headers.get("x-chatrouter-cache") is None
             second = _ask(cached_client, chatrouter={"session_id": "sess-a"})
-        assert second.headers["x-chatrouter-cache"] == "HIT"
-        assert calls["n"] == 1
+            assert second.headers["x-chatrouter-cache"] == "HIT"
 
-    def test_session_affinity_aware_drift_to_other_model_misses(self, cached_client):
-        """If a session drifts to a different model (e.g. tier jump), the
-        session-scoped key changes, so the old model's cached answer is not
-        served — correctness is preserved across the drift."""
-        calls = {"n": 0}
-
-        def _mk(content):
-            def _c(_):
-                calls["n"] += 1
-                return httpx.Response(200, json=completion_body(content=content))
-
-            return _c
-
-        with respx.mock:
-            respx.post(UPSTREAM).mock(side_effect=[_mk("cheap-ans"), _mk("reasoner-ans")])
-            # Force economy on the first turn, reasoning on the second; the tier
-            # jump exceeds max_drift_tiers so affinity does not pin the session.
+            # Tier jump beyond max_drift_tiers swaps models -> key changes.
             a = _ask(cached_client, chatrouter={"session_id": "sess-b", "min_tier": "economy"})
             b = _ask(cached_client, chatrouter={"session_id": "sess-b", "min_tier": "reasoning"})
-        assert a.json()["choices"][0]["message"]["content"] == "cheap-ans"
-        assert b.json()["choices"][0]["message"]["content"] == "reasoner-ans"
-        # Different models => different session-scoped keys => both hit upstream.
-        assert calls["n"] == 2
+            assert a.json()["choices"][0]["message"]["content"] == "cheap-ans"
+            assert b.json()["choices"][0]["message"]["content"] == "reasoner-ans"
 
-    def test_session_affinity_aware_distinct_sessions_miss(self, cached_client):
-        """Two different session ids scope the cache separately even with the
-        same messages and resolved model."""
-        calls = {"n": 0}
-
-        def _mk(content):
-            def _c(_):
-                calls["n"] += 1
-                return httpx.Response(200, json=completion_body(content=content))
-
-            return _c
-
-        with respx.mock:
-            respx.post(UPSTREAM).mock(side_effect=[_mk("x1"), _mk("x2")])
-            a = _ask(cached_client, chatrouter={"session_id": "sess-x"})
-            b = _ask(cached_client, chatrouter={"session_id": "sess-y"})
-        assert a.json()["choices"][0]["message"]["content"] == "x1"
-        assert b.json()["choices"][0]["message"]["content"] == "x2"
-        assert calls["n"] == 2
+            # Distinct sessions scope the cache separately.
+            x = _ask(cached_client, chatrouter={"session_id": "sess-x"})
+            y = _ask(cached_client, chatrouter={"session_id": "sess-y"})
+            assert x.json()["choices"][0]["message"]["content"] == "x1"
+            assert y.json()["choices"][0]["message"]["content"] == "x2"
+        # 5 upstream calls: sess-a first, sess-b drift (2), sess-x/sess-y (2).
+        assert calls["n"] == 5
 
     def test_disabled_cache_does_not_short_circuit(self):
         config = make_config()  # response_cache.enabled defaults to False
@@ -297,17 +269,9 @@ class TestResponseCache:
         assert calls["n"] == 2
 
 
-def _run(coro):
-    import asyncio
-
-    return asyncio.run(coro)
-
-
 class TestResponseCacheExpiry:
     def test_entry_expires_after_ttl(self, cached_client, monkeypatch):
         """After the TTL elapses the cache miss path runs and hits upstream."""
-        import time
-
         real_time = time.time
         upstream_calls = {"n": 0}
 

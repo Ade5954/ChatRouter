@@ -6,6 +6,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from ..config.models import TenantConfig
 from ..core.errors import ChatRouterError
@@ -61,12 +62,22 @@ async def chat_completions(
                 "connection": "keep-alive",
                 "x-accel-buffering": "no",
             },
+            # Accounting runs once the stream is exhausted, off the client's
+            # read path: the terminal chunk is forwarded, then the background
+            # task books quota/feedback/affinity.
+            background=BackgroundTask(service._finalise_stream_bg, context, projected_tokens),
         )
 
-    body, _ = await service.complete(context, projected_tokens)
+    body, result = await service.complete(context, projected_tokens)
     if context.cache_hit:
         headers["x-chatrouter-cache"] = "HIT"
-    return JSONResponse(content=body, headers=headers)
+    return JSONResponse(
+        content=body,
+        headers=headers,
+        # The body is committed before accounting, so quota/billing/feedback
+        # never add to the latency the caller observes.
+        background=BackgroundTask(service._finalise_success_bg, context, result, projected_tokens),
+    )
 
 
 @router.get("/v1/models", tags=["openai"], response_model=ModelList)
