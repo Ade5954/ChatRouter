@@ -180,6 +180,37 @@ curl -X POST http://localhost:8000/v1/routing/explain \
 
 ---
 
+## Web Console
+
+The gateway ships a zero-backend, pure-static management console (`src/chatrouter/static`). Start the gateway and open **http://localhost:8000/**. Keys live only in the browser's localStorage and are used solely to call the gateway itself.
+
+| Page | Purpose |
+|------|---------|
+| **Dashboard** | Live model state: effective quality, load, latency EMA, failure rate, circuit breakers, plus tenant rate-limit / quota usage |
+| **Chat** | Talk to the gateway directly (the router picks the model; no manual switching). After each turn the sidebar explains the routing decision for that turn |
+| **Routing Decision** | Paste a multi-turn conversation and dry-run the routing decision (no upstream call) |
+| **Settings** | Configure real providers (Base URL / API Key) and map models to tiers; saving persists the config and hot-reloads it |
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+![Chat with live routing decision](docs/screenshots/chat.png)
+
+![Routing decision explanation](docs/screenshots/playground.png)
+
+![Model configuration](docs/screenshots/settings.png)
+
+### Quick User Guide
+
+1. **Start the gateway**: `python -m chatrouter`, open `http://localhost:8000/` in a browser.
+2. **Enter keys**: on first load, enter the admin key (for `/admin/*`, default `admin-secret`) and a tenant API key (for Chat / Routing Decision; see `tenants[].api_keys` in `config.yaml`). Keys can also be passed via URL: `/?admin=xxx&tenant=yyy`.
+3. **Chat**: switch to **Chat**, type a message and press Enter. Replies render as Markdown; the right-hand **Routing Decision** panel shows which model served the request, the complexity score, the candidate utility breakdown (quality / cost / latency / load) and the reason.
+4. **Configure real models**: switch to **Settings**, fill in the provider Base URL and API Key, and map models to the economy / standard / premium / reasoning tiers with cost and quality priors. Saving writes back to `config.yaml` and hot-reloads it — no restart needed.
+5. **Secret handling**: API keys are redacted (`***`) when read back; leaving the field empty (or starting with `***`) keeps the stored value.
+
+> Chat requires a reachable upstream: the default config uses example URLs — configure real providers/models in **Settings** first.
+
+---
+
 ## API Overview
 
 | Method | Path | Description |
@@ -193,6 +224,7 @@ curl -X POST http://localhost:8000/v1/routing/explain \
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/admin/status` | Live load, circuit breakers, quotas, learned quality |
 | GET | `/admin/config` | Effective config (credentials redacted) |
+| PUT | `/admin/config` | Update providers / models / tenants, persist to the config file and hot-reload |
 
 ### Response Headers
 
@@ -265,9 +297,16 @@ Test coverage: complexity analysis (including the key context-awareness assertio
 
 ---
 
+## Recent Updates
+
+- **Explainable routing console**: bundled web UI (Dashboard / Chat / Routing Decision / Settings); the Chat page explains how each turn is routed and how quality / cost / latency / load are balanced.
+- **Latency reduction**: accounting (quota / feedback / session affinity / cache write-through) moved off the response path into background tasks; complexity analysis and token estimation run off the event loop; per-model stats are fetched in parallel.
+- **Config hot-reload**: `PUT /admin/config` validates, persists to `config.yaml` and hot-reloads — provider / model / tier changes take effect immediately without a restart.
+- **Streaming failure visibility**: upstream failures are emitted in-band as SSE `error` events followed by `[DONE]` instead of a silent broken stream.
+
 ## Scope
 
-This project **focuses solely on backend LLM traffic governance** and does not include: agent workflow orchestration, RAG retrieval orchestration, model training/fine-tuning, or front-end UI.
+This project focuses on backend LLM traffic governance and ships a lightweight web console (Dashboard / Chat / routing-decision explainer / model configuration). It does not include: agent workflow orchestration, RAG retrieval orchestration, model training or fine-tuning.
 
 ## References
 

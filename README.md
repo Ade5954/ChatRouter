@@ -181,6 +181,37 @@ curl -X POST http://localhost:8000/v1/routing/explain \
 
 ---
 
+## Web 管理控制台
+
+网关自带一个零后端的纯静态控制台（`src/chatrouter/static`），启动后直接访问 **http://localhost:8000/** 即可。密钥只保存在浏览器 localStorage 中，仅用于请求网关自身。
+
+| 页面 | 用途 |
+|------|------|
+| **Dashboard** | 模型实时状态：综合质量、负载、延迟 EMA、失败率、熔断状态，以及租户限流 / 配额用量 |
+| **对话** | 直接与网关对话（模型由路由自动选择，不可手动切换），每轮完成后右侧实时展示本轮路由决策 |
+| **路由决策** | 手动输入多轮对话，试算并解释路由决策（不真正调用上游模型） |
+| **设置** | 配置真实 provider（Base URL / API Key）与模型到具体档位，保存后热重载即时生效 |
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+![对话与实时路由决策](docs/screenshots/chat.png)
+
+![路由决策解释](docs/screenshots/playground.png)
+
+![模型配置](docs/screenshots/settings.png)
+
+### 使用指引
+
+1. **启动网关**：`python -m chatrouter`，浏览器打开 `http://localhost:8000/`。
+2. **配置密钥**：首次打开会提示输入 admin key（`/admin/*` 接口用，默认 `admin-secret`）与租户 API key（对话 / 路由决策用，见 `config.yaml` 的 `tenants[].api_keys`）。也可用 URL 携带：`/?admin=xxx&tenant=yyy`。
+3. **对话**：切到「对话」，输入消息回车发送。回复以 Markdown 渲染；右侧「本轮路由决策」面板展示这次请求被路由到哪个模型、复杂度分数、候选模型效用分解（质量 / 成本 / 延迟 / 负载）与决策理由。
+4. **配置真实模型**：切到「设置」，填好 provider 的 Base URL 与 API Key，把模型挂到 economy / standard / premium / reasoning 档位并填写成本与质量先验。保存后写回 `config.yaml` 并热重载，立即生效（无需重启）。
+5. **密钥脱敏**：API Key 回读时自动脱敏（`***`），提交时留空或以 `***` 开头表示保持不变。
+
+> 对话依赖可用的上游模型：默认配置为示例地址，需先在「设置」页填入真实 provider 与模型。
+
+---
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -194,6 +225,7 @@ curl -X POST http://localhost:8000/v1/routing/explain \
 | GET | `/metrics` | Prometheus 指标 |
 | GET | `/admin/status` | 实时负载、熔断、配额、学习到的质量 |
 | GET | `/admin/config` | 生效配置（凭据已脱敏） |
+| PUT | `/admin/config` | 更新 provider / 模型 / 租户并写回配置文件、热重载即时生效 |
 
 ### 响应头
 
@@ -266,9 +298,16 @@ ruff check src tests
 
 ---
 
+## 近期更新
+
+- **可解释路由控制台**：内置 Web 管理界面（Dashboard / 对话 / 路由决策 / 设置），对话页每轮实时解释路由如何分配、如何在质量 / 成本 / 延迟 / 负载之间平衡。
+- **低时延改造**：记账（配额 / 反馈 / 会话亲和 / 缓存写穿）全部异步化到响应提交之后；复杂度分析与 token 估算移出事件循环；逐模型统计改为并行读取。
+- **配置热重载**：`PUT /admin/config` 校验合并后写回 `config.yaml` 并热重载，provider / 模型 / 档位调整即时生效，无需重启进程。
+- **流式失败可见性**：上游失败以 SSE `error` 事件随流返回并以 `[DONE]` 收尾，客户端不再面对静默断流。
+
 ## 范围说明
 
-本项目**仅聚焦后端 LLM 流量治理**，不包含：智能体工作流编排、RAG 检索编排、模型训练与微调、前端交互界面。
+本项目聚焦后端 LLM 流量治理，并附带一个轻量 Web 管理控制台（Dashboard / 对话 / 路由决策解释 / 模型配置）。不包含：智能体工作流编排、RAG 检索编排、模型训练与微调。
 
 ## 参考文献
 
