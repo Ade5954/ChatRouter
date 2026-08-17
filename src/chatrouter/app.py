@@ -5,11 +5,13 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .api.routes import admin_router, build_metrics_route, router
 from .config.loader import load_config
@@ -20,6 +22,9 @@ from .observability.logging import configure_logging, get_logger
 from .service import GatewayService
 
 logger = get_logger(__name__)
+
+# Optional bundled web UI (served at ``/`` when the directory is present).
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def create_app(config: AppConfig | None = None, config_path: str | None = None) -> FastAPI:
@@ -99,5 +104,15 @@ def create_app(config: AppConfig | None = None, config_path: str | None = None) 
     app.include_router(admin_router)
     if app_config.observability.metrics_enabled:
         app.include_router(build_metrics_route(app_config.observability.metrics_path))
+
+    # Bundled web UI: the management console is served at ``/`` whenever the
+    # static assets ship with the package. The API remains fully usable
+    # without it.
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+        @app.get("/", include_in_schema=False)
+        async def index() -> FileResponse:
+            return FileResponse(STATIC_DIR / "index.html")
 
     return app

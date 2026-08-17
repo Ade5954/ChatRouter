@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatRouter Console</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">CR</span>
+      <span class="title">ChatRouter</span>
+      <span class="subtitle">LLM 流量网关控制台</span>
+    </div>
+    <nav class="nav">
+      <button class="nav-btn active" data-view="dashboard">Dashboard</button>
+      <button class="nav-btn" data-view="playground">路由决策</button>
+    </nav>
+    <div class="conn">
+      <span id="conn-status" class="conn-dot" title="后端连接状态"></span>
+      <span id="conn-text" class="conn-text">未连接</span>
+    </div>
+  </header>
+
+  <section id="login" class="login-card hidden">
+    <h2>密钥配置</h2>
+    <p class="hint">
+      密钥仅保存在本浏览器（localStorage），只用于请求网关自身，不会上传到其它地方。
+      Dashboard 需要 <b>admin key</b>（<code>x-admin-key</code>），路由决策需要 <b>租户 API key</b>（<code>Authorization: Bearer</code>）。
+    </p>
+    <div class="field">
+      <label for="admin-key">Admin Key</label>
+      <input id="admin-key" type="password" placeholder="admin-secret">
+    </div>
+    <div class="field">
+      <label for="tenant-key">Tenant API Key</label>
+      <input id="tenant-key" type="password" placeholder="sk-test-acme">
+    </div>
+    <div class="field-row">
+      <button id="save-keys" class="btn primary">保存</button>
+      <button id="clear-keys" class="btn ghost">清除</button>
+      <span id="key-saved" class="ok hidden">已保存 ✓</span>
+    </div>
+    <p class="hint">
+      也可直接把密钥附在 URL 上：<code>/?admin=xxx&amp;tenant=yyy</code>（便于分享只读链接）。
+    </p>
+  </section>
+
+  <main>
+    <!-- ============ Dashboard ============ -->
+    <section id="view-dashboard" class="view">
+      <div class="toolbar">
+        <h2>模型状态</h2>
+        <button id="refresh" class="btn small">刷新</button>
+        <label class="auto"><input type="checkbox" id="auto-refresh" checked> 自动刷新（5s）</label>
+        <span id="last-updated" class="muted"></span>
+      </div>
+
+      <div id="model-grid" class="grid">
+        <div class="empty">加载中…</div>
+      </div>
+
+      <h2 class="section-title">租户用量</h2>
+      <div id="tenant-list" class="panel">
+        <div class="empty">加载中…</div>
+      </div>
+    </section>
+
+    <!-- ============ Playground ============ -->
+    <section id="view-playground" class="view hidden">
+      <div class="panel">
+        <h2>路由决策解释</h2>
+        <p class="hint">
+          输入一段对话，每行一条消息，格式 <code>role: 内容</code>（role 为 user / assistant / system / tool）。
+          网关会对<b>完整对话历史</b>打分并展示决策依据 —— 不真正调用上游模型。
+        </p>
+        <textarea id="convo" rows="10" spellcheck="false">user: 用归纳法证明这个递归算法的复杂度是最优的，并给出完整推导。
+assistant: 设递推式为 T(n)=2T(n/2)+O(n)，主定理给出 T(n)=O(n log n)。
+user: 那另一种情况呢？</textarea>
+        <div class="field-row">
+          <button id="explain-btn" class="btn primary">分析路由决策</button>
+          <label class="inline">目标模型
+            <select id="pg-model">
+              <option value="auto">auto</option>
+            </select>
+          </label>
+          <span id="pg-status" class="muted"></span>
+        </div>
+      </div>
+
+      <div id="decision" class="hidden"></div>
+    </section>
+  </main>
+
+  <footer class="muted">ChatRouter · 可解释的上下文感知路由 · 反馈自适应策略</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
