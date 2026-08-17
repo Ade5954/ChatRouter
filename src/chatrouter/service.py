@@ -89,6 +89,8 @@ class GatewayService:
         self.providers = ProviderPool(config.providers)
         self.dispatcher = Dispatcher(config, self.providers, self.breakers, self.load_tracker)
         self.response_cache = ResponseCache(config.routing.response_cache, self.storage)
+        # Provider pools replaced by :meth:`reload`; closed on shutdown.
+        self._retired_pools: list[ProviderPool] = []
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -104,7 +106,54 @@ class GatewayService:
 
     async def close(self) -> None:
         await self.providers.close()
+        for pool in self._retired_pools:
+            await pool.close()
         await self.storage.close()
+
+    async def reload(self, new_config: AppConfig) -> None:
+        """Hot-swap the configuration without dropping the process.
+
+        Every component is rebuilt from ``new_config``; the storage backend is
+        kept (its counters/learned statistics survive the reload). In-flight
+        requests hold references to the old dispatcher and provider pool, so
+        the old pool is closed after a grace window instead of immediately
+        (and on shutdown as well).
+        """
+        old_providers = self.providers
+        self.config = new_config
+        self.tenants = TenantRegistry(new_config)
+        self.breakers = CircuitBreakerRegistry(new_config.resilience.circuit_breaker)
+        self.load_tracker = ModelLoadTracker(self.storage, new_config.resilience.overflow)
+        self.feedback = FeedbackStore(self.storage, new_config.routing.feedback)
+        self.feedback_normalizer = FeedbackNormalizer.from_feedback_config(
+            new_config.routing.feedback
+        )
+        self.router = Router(
+            new_config, self.feedback, self.load_tracker, self.breakers, self.storage
+        )
+        self.rate_limiter = RateLimiter(self.storage)
+        self.quotas = QuotaManager(self.storage)
+        self.providers = ProviderPool(new_config.providers)
+        self.dispatcher = Dispatcher(
+            new_config, self.providers, self.breakers, self.load_tracker
+        )
+        self.response_cache = ResponseCache(new_config.routing.response_cache, self.storage)
+
+        self._retired_pools.append(old_providers)
+        asyncio.get_running_loop().create_task(self._close_old_providers(old_providers))
+        logger.info(
+            "configuration reloaded",
+            models=len(new_config.models),
+            providers=len(new_config.providers),
+            tenants=len(new_config.tenants),
+        )
+
+    async def _close_old_providers(self, pool: ProviderPool, grace_seconds: float = 60.0) -> None:
+        """Close a replaced provider pool after in-flight requests drain."""
+        await asyncio.sleep(grace_seconds)
+        await pool.close()
+        if pool in self._retired_pools:
+            self._retired_pools.remove(pool)
 
     # -- chat completions -------------------------------------------------------
 
@@ -307,7 +356,12 @@ class GatewayService:
                 yield chunk
         except ChatRouterError as exc:
             await self._finalise_failure(context, projected_tokens, exc)
-            raise
+            # The response has already started (HTTP 200 + SSE headers), so a
+            # raise would leave the client with a silent empty stream. Emit the
+            # failure in-band instead; the terminal [DONE] lets SSE parsers
+            # finish cleanly.
+            yield self.dispatcher._error_event(exc)
+            yield b"data: [DONE]\n\n"
         finally:
             await self.rate_limiter.release(tenant)
 

@@ -30,6 +30,11 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 def create_app(config: AppConfig | None = None, config_path: str | None = None) -> FastAPI:
     """Build the ASGI application."""
     app_config = config or load_config(config_path)
+    effective_path = None
+    if config is None:
+        from .config.loader import resolve_config_path
+
+        effective_path = str(resolve_config_path(config_path))
     configure_logging(app_config.observability.log_level, app_config.observability.log_json)
 
     @asynccontextmanager
@@ -52,6 +57,7 @@ def create_app(config: AppConfig | None = None, config_path: str | None = None) 
         lifespan=lifespan,
     )
     app.state.config = app_config
+    app.state.config_path = effective_path
 
     if app_config.server.cors_origins:
         app.add_middleware(

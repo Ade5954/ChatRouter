@@ -230,11 +230,16 @@ async function runExplain() {
 
 function renderDecision(data) {
   const box = $("#decision");
+  box.classList.remove("hidden");
+  box.innerHTML = decisionHtml(data);
+}
+
+/* Decision breakdown as pure HTML; shared by the Playground and the live
+ * chat sidebar so the same explanation appears in both places. */
+function decisionHtml(data) {
   const d = data.decision;
   const a = d.assessment;
-  box.classList.remove("hidden");
-
-  box.innerHTML = `
+  return `
     <div class="panel">
       <div class="decision-header">
         <div>
@@ -304,15 +309,321 @@ function renderSignals(a) {
   </div>`;
 }
 
-/* ---------------- nav & wiring ---------------- */
+/* ---------------- Live Chat ---------------- */
+
+let chatSession = [];
+let chatBusy = false;
+
+/* Render LLM output as markdown; the emitted HTML is sanitised so model
+ * output cannot inject scripts into the console page. */
+function sanitizeHtml(html) {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  tpl.content.querySelectorAll("script, iframe, object, embed, style, link, meta").forEach((el) => el.remove());
+  tpl.content.querySelectorAll("*").forEach((el) => {
+    [...el.attributes].forEach((attr) => {
+      if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+      if (attr.name === "href" && /^\s*javascript:/i.test(attr.value)) el.remove();
+    });
+  });
+  return tpl.innerHTML;
+}
+
+function renderMarkdown(text) {
+  if (window.marked) {
+    return sanitizeHtml(marked.parse(String(text ?? ""), { breaks: true, gfm: true }));
+  }
+  return `<pre class="md-fallback">${esc(text)}</pre>`;
+}
+
+function appendChatMessage(role, text, typing) {
+  const log = $("#chat-log");
+  const empty = log.querySelector(".empty");
+  if (empty) empty.remove();
+  const div = document.createElement("div");
+  div.className = `msg ${role}`;
+  if (role === "assistant") {
+    div.innerHTML = '<div class="bubble md"></div>';
+    const bubble = div.querySelector(".bubble");
+    bubble.dataset.content = "";
+    if (typing) bubble.innerHTML = '<span class="typing">▍</span>';
+    else bubble.innerHTML = renderMarkdown(text);
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    return bubble;
+  }
+  div.innerHTML = `<div class="bubble">${esc(text)}</div>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div.querySelector(".bubble");
+}
+
+/* Incremental markdown update while the stream is live. */
+function updateTyping(bubble, content) {
+  bubble.dataset.content = content;
+  bubble.innerHTML = renderMarkdown(content) + '<span class="typing">▍</span>';
+  const log = $("#chat-log");
+  log.scrollTop = log.scrollHeight;
+}
+
+/* Parse an OpenAI SSE stream from the gateway, invoking onDelta per chunk. */
+async function streamChat(messages, onDelta) {
+  const res = await fetch("/v1/chat/completions", {
+    method: "POST",
+    headers: { ...tenantHeaders(), "content-type": "application/json" },
+    body: JSON.stringify({ model: "auto", stream: true, messages }),
+  });
+  if (!res.ok || !res.body) {
+    let msg = `HTTP ${res.status}`;
+    try { const body = await res.json(); msg = (body.error && body.error.message) || msg; } catch { /* non-JSON */ }
+    throw new Error(msg);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") return;
+      try {
+        const evt = JSON.parse(data);
+        if (evt.error) throw new Error(evt.error.message || JSON.stringify(evt.error));
+        const delta = evt.choices && evt.choices[0] && evt.choices[0].delta;
+        if (delta && typeof delta.content === "string") onDelta(delta.content);
+      } catch (err) {
+        if (err instanceof SyntaxError) continue; /* ignore non-JSON keep-alives */
+        throw err;
+      }
+    }
+  }
+}
+
+async function explainChat(messages) {
+  const box = $("#chat-decision");
+  if (!store.tenant) {
+    box.innerHTML = '<div class="empty">需要配置租户 API key。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="empty">正在分析本轮路由…</div>';
+  try {
+    const data = await fetchJSON("/v1/routing/explain", {
+      method: "POST",
+      headers: { ...tenantHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ model: "auto", messages }),
+    });
+    box.innerHTML = decisionHtml(data);
+  } catch (e) {
+    box.innerHTML = `<div class="error-box">分析失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function sendChatMessage() {
+  const input = $("#chat-text");
+  const text = input.value.trim();
+  if (!text || chatBusy) return;
+  if (!store.tenant) {
+    $("#chat-decision").innerHTML = '<div class="empty">需要配置租户 API key。</div>';
+    return;
+  }
+
+  const userMsg = { role: "user", content: text };
+  chatSession.push(userMsg);
+  appendChatMessage("user", text);
+  input.value = "";
+  chatBusy = true;
+  $("#chat-send").disabled = true;
+  $("#chat-send").textContent = "…";
+
+  /* The routing decision is evaluated on the conversation as sent (the user
+   * message is already in chatSession; the reply is not yet). */
+  explainChat(chatSession);
+
+  const bubble = appendChatMessage("assistant", "", true);
+  try {
+    let content = "";
+    await streamChat(chatSession, (delta) => {
+      content += delta;
+      updateTyping(bubble, content);
+    });
+    bubble.dataset.content = content;
+    bubble.innerHTML = renderMarkdown(content);
+    chatSession.push({ role: "assistant", content });
+  } catch (e) {
+    bubble.innerHTML = `<div class="error-box">对话失败：${esc(e.message)}</div>`;
+  } finally {
+    chatBusy = false;
+    $("#chat-send").disabled = false;
+    $("#chat-send").textContent = "发送";
+    const log = $("#chat-log");
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+function clearChat() {
+  chatSession = [];
+  $("#chat-log").innerHTML = '<div class="empty">发送一条消息开始对话，右侧会展示本轮的完整路由决策。</div>';
+  $("#chat-decision").innerHTML = '<div class="empty">等待对话…</div>';
+}
+
+/* ---------------- Settings ---------------- */
+
+const TIERS = ["economy", "standard", "premium", "reasoning"];
+let cfgData = null;
+
+async function loadSettings() {
+  const status = $("#cfg-status");
+  if (!store.admin) {
+    status.textContent = "需要 admin key。";
+    return;
+  }
+  try {
+    const data = await fetchJSON("/admin/config", { headers: adminHeaders() });
+    cfgData = data;
+    renderProviderRows(data.providers || []);
+    renderModelRows(data.models || [], data.providers || []);
+    status.textContent = "已加载";
+  } catch (e) {
+    status.textContent = "加载失败";
+    $("#provider-rows").innerHTML = `<div class="error-box">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderProviderRows(providers) {
+  $("#provider-rows").innerHTML = `
+    <div class="cfg-grid cfg-grid-provider">
+      <span class="cfg-th">名称</span><span class="cfg-th">Base URL</span><span class="cfg-th">API Key（留空不变）</span><span></span>
+      ${providers.map((p, i) => `
+        <input class="cfg-name" data-i="${i}" value="${esc(p.name)}" placeholder="provider 名">
+        <input class="cfg-url" data-i="${i}" value="${esc(p.base_url || "")}" placeholder="https://api.xxx.com/v1">
+        <input class="cfg-key" data-i="${i}" type="password" value="" placeholder="${p.api_key ? "已配置，留空保持不变" : "api key"}">
+        <button class="btn small ghost row-del" data-i="${i}" title="删除">✕</button>`).join("")}
+    </div>`;
+}
+
+function renderModelRows(models, providers) {
+  const names = providers.map((p) => p.name);
+  $("#model-rows").innerHTML = `
+    <div class="cfg-grid cfg-grid-model">
+      <span class="cfg-th">ID</span><span class="cfg-th">Provider</span><span class="cfg-th">上游模型</span>
+      <span class="cfg-th">档位</span><span class="cfg-th">输入$/1k</span><span class="cfg-th">输出$/1k</span>
+      <span class="cfg-th">上下文</span><span class="cfg-th">质量</span><span class="cfg-th">延迟ms</span><span></span>
+      ${models.map((m, i) => `
+        <input class="m-id" data-i="${i}" value="${esc(m.id)}" placeholder="路由 id">
+        <select class="m-provider" data-i="${i}">${names.map((n) => `<option ${n === m.provider ? "selected" : ""}>${esc(n)}</option>`).join("")}</select>
+        <input class="m-upstream" data-i="${i}" value="${esc(m.upstream_model || "")}" placeholder="上游模型名">
+        <select class="m-tier" data-i="${i}">${TIERS.map((t) => `<option ${t === m.tier ? "selected" : ""}>${t}</option>`).join("")}</select>
+        <input class="m-in" data-i="${i}" type="number" step="0.0001" min="0" value="${m.input_cost_per_1k ?? 0}" title="输入价格（$/1k tokens）">
+        <input class="m-out" data-i="${i}" type="number" step="0.001" min="0" value="${m.output_cost_per_1k ?? 0}" title="输出价格（$/1k tokens）">
+        <input class="m-ctx" data-i="${i}" type="number" step="1000" min="1000" value="${m.context_window ?? 128000}" title="上下文窗口">
+        <input class="m-quality" data-i="${i}" type="number" step="0.05" min="0" max="1" value="${m.quality_prior ?? 0.5}" title="质量先验 [0,1]">
+        <input class="m-latency" data-i="${i}" type="number" step="100" min="1" value="${m.latency_prior_ms ?? 2000}" title="延迟先验（ms）">
+        <button class="btn small ghost row-del" data-i="${i}" title="删除">✕</button>`).join("")}
+    </div>`;
+}
+
+function collectProviders() {
+  const grid = document.querySelector("#provider-rows .cfg-grid-provider");
+  if (!grid) return [];
+  const names = grid.querySelectorAll(".cfg-name");
+  const urls = grid.querySelectorAll(".cfg-url");
+  const keys = grid.querySelectorAll(".cfg-key");
+  const out = [];
+  names.forEach((el, i) => {
+    const name = el.value.trim();
+    const url = urls[i] ? urls[i].value.trim() : "";
+    if (!name || !url) return;
+    const item = { name, base_url: url };
+    const key = keys[i] ? keys[i].value.trim() : "";
+    if (key) item.api_key = key;
+    out.push(item);
+  });
+  return out;
+}
+
+function collectModels() {
+  const grid = document.querySelector("#model-rows .cfg-grid-model");
+  if (!grid) return [];
+  const ids = grid.querySelectorAll(".m-id");
+  const providers = grid.querySelectorAll(".m-provider");
+  const upstreams = grid.querySelectorAll(".m-upstream");
+  const tiers = grid.querySelectorAll(".m-tier");
+  const ins = grid.querySelectorAll(".m-in");
+  const outs = grid.querySelectorAll(".m-out");
+  const ctxs = grid.querySelectorAll(".m-ctx");
+  const qualities = grid.querySelectorAll(".m-quality");
+  const latencies = grid.querySelectorAll(".m-latency");
+  const out = [];
+  ids.forEach((el, i) => {
+    const id = el.value.trim();
+    const provider = providers[i] ? providers[i].value : "";
+    if (!id || !provider) return;
+    out.push({
+      id,
+      provider,
+      upstream_model: upstreams[i] ? upstreams[i].value.trim() : "",
+      tier: tiers[i] ? tiers[i].value : "standard",
+      input_cost_per_1k: ins[i] ? parseFloat(ins[i].value) || 0 : 0,
+      output_cost_per_1k: outs[i] ? parseFloat(outs[i].value) || 0 : 0,
+      context_window: ctxs[i] ? parseInt(ctxs[i].value, 10) || 128000 : 128000,
+      quality_prior: qualities[i] ? parseFloat(qualities[i].value) || 0.5 : 0.5,
+      latency_prior_ms: latencies[i] ? parseFloat(latencies[i].value) || 2000 : 2000,
+    });
+  });
+  return out;
+}
+
+function deleteProviderRow(i) {
+  const providers = collectProviders();
+  providers.splice(i, 1);
+  renderProviderRows(providers);
+  renderModelRows(collectModels(), providers);
+}
+
+function deleteModelRow(i) {
+  const models = collectModels();
+  models.splice(i, 1);
+  renderModelRows(models, collectProviders());
+}
+
+async function saveSettings() {
+  const status = $("#cfg-saved");
+  if (!store.admin) return;
+  status.classList.remove("hidden");
+  status.textContent = "保存中…";
+  try {
+    const body = { providers: collectProviders(), models: collectModels() };
+    await fetchJSON("/admin/config", {
+      method: "PUT",
+      headers: { ...adminHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    status.textContent = "已保存并热重载 ✓";
+    setTimeout(() => status.classList.add("hidden"), 2500);
+    loadSettings();
+    loadModelsIntoSelect();
+  } catch (e) {
+    status.textContent = `保存失败：${e.message}`;
+  }
+}
+
 
 function switchView(view) {
   currentView = view;
   document.querySelectorAll(".nav-btn").forEach((b) =>
     b.classList.toggle("active", b.dataset.view === view));
   $("#view-dashboard").classList.toggle("hidden", view !== "dashboard");
+  $("#view-chat").classList.toggle("hidden", view !== "chat");
   $("#view-playground").classList.toggle("hidden", view !== "playground");
+  $("#view-settings").classList.toggle("hidden", view !== "settings");
   if (view === "dashboard") loadDashboard();
+  if (view === "settings") loadSettings();
 }
 
 async function loadModelsIntoSelect() {
@@ -353,6 +664,41 @@ function init() {
   $("#explain-btn").addEventListener("click", runExplain);
   $("#convo").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) runExplain();
+  });
+
+  // --- chat wiring ---
+  $("#chat-send").addEventListener("click", sendChatMessage);
+  $("#chat-text").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
+  $("#chat-clear").addEventListener("click", clearChat);
+
+  // --- settings wiring ---
+  $("#add-provider").addEventListener("click", () => {
+    const providers = collectProviders();
+    providers.push({ name: "", base_url: "", api_key: "" });
+    renderProviderRows(providers);
+  });
+  $("#add-model").addEventListener("click", () => {
+    const models = collectModels();
+    models.push({
+      id: "", provider: "", upstream_model: "", tier: "standard",
+      input_cost_per_1k: 0, output_cost_per_1k: 0, context_window: 128000,
+      quality_prior: 0.5, latency_prior_ms: 2000,
+    });
+    renderModelRows(models, collectProviders());
+  });
+  $("#save-config").addEventListener("click", saveSettings);
+  $("#provider-rows").addEventListener("click", (e) => {
+    const btn = e.target.closest(".row-del");
+    if (btn) deleteProviderRow(parseInt(btn.dataset.i, 10));
+  });
+  $("#model-rows").addEventListener("click", (e) => {
+    const btn = e.target.closest(".row-del");
+    if (btn) deleteModelRow(parseInt(btn.dataset.i, 10));
   });
 
   renderLogin();

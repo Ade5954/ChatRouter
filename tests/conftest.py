@@ -6,6 +6,7 @@ import pytest
 
 from chatrouter.config.models import (
     AppConfig,
+    FeedbackConfig,
     ModelConfig,
     ModelTier,
     ProviderConfig,
@@ -23,7 +24,12 @@ def make_config(**overrides) -> AppConfig:
     """Build a small but representative configuration for tests."""
     base = {
         "server": ServerConfig(require_auth=True, admin_api_key="admin-secret"),
-        "routing": RoutingConfig(default_model="mid"),
+        # Epsilon-greedy exploration is disabled by default so tests are
+        # deterministic; tests that exercise exploration opt in explicitly.
+        "routing": RoutingConfig(
+            default_model="mid",
+            feedback=FeedbackConfig(exploration_ratio=0.0),
+        ),
         "providers": [
             ProviderConfig(name="p1", base_url="https://p1.test/v1", api_key="k1"),
         ],

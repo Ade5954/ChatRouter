@@ -43,7 +43,9 @@ def main() -> int:
         uvicorn.run("chatrouter.app:create_app", host=host, port=port, reload=True, factory=True)
     else:
         uvicorn.run(
-            create_app(config),
+            # Pass the path rather than the parsed config so the app knows
+            # where to persist admin config edits (create_app records it).
+            create_app(config_path=args.config),
             host=host,
             port=port,
             workers=1,

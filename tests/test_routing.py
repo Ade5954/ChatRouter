@@ -26,7 +26,9 @@ async def feedback_service():
     config = make_config(
         routing=RoutingConfig(
             default_model="mid",
-            feedback=FeedbackConfig(min_samples=1, ema_alpha=0.5, learning_rate=0.5),
+            feedback=FeedbackConfig(
+                min_samples=1, ema_alpha=0.5, learning_rate=0.5, exploration_ratio=0.0
+            ),
         )
     )
     service = GatewayService(config)

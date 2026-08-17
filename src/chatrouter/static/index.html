@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ChatRouter Console</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" crossorigin="anonymous"></script>
 </head>
 <body>
   <header class="topbar">
@@ -15,7 +16,9 @@
     </div>
     <nav class="nav">
       <button class="nav-btn active" data-view="dashboard">Dashboard</button>
+      <button class="nav-btn" data-view="chat">对话</button>
       <button class="nav-btn" data-view="playground">路由决策</button>
+      <button class="nav-btn" data-view="settings">设置</button>
     </nav>
     <div class="conn">
       <span id="conn-status" class="conn-dot" title="后端连接状态"></span>
@@ -27,7 +30,7 @@
     <h2>密钥配置</h2>
     <p class="hint">
       密钥仅保存在本浏览器（localStorage），只用于请求网关自身，不会上传到其它地方。
-      Dashboard 需要 <b>admin key</b>（<code>x-admin-key</code>），路由决策需要 <b>租户 API key</b>（<code>Authorization: Bearer</code>）。
+      Dashboard 与<b>设置</b>需要 <b>admin key</b>（<code>x-admin-key</code>），<b>对话</b>与<b>路由决策</b>需要 <b>租户 API key</b>（<code>Authorization: Bearer</code>）。
     </p>
     <div class="field">
       <label for="admin-key">Admin Key</label>
@@ -90,6 +93,71 @@ user: 那另一种情况呢？</textarea>
       </div>
 
       <div id="decision" class="hidden"></div>
+    </section>
+
+    <!-- ============ Chat ============ -->
+    <section id="view-chat" class="view hidden">
+      <div class="chat-layout">
+        <div class="chat-main">
+          <div class="panel chat-panel">
+            <div class="chat-head">
+              <h2>实时对话</h2>
+              <span class="muted">模型由网关自动路由，不手动切换</span>
+              <button id="chat-clear" class="btn small ghost">清空</button>
+            </div>
+            <div id="chat-log" class="chat-log">
+              <div class="empty">发送一条消息开始对话，右侧会展示本轮的完整路由决策。</div>
+            </div>
+            <div class="chat-input">
+              <textarea id="chat-text" rows="3" spellcheck="false"
+                placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+              <button id="chat-send" class="btn primary">发送</button>
+            </div>
+          </div>
+        </div>
+        <aside class="chat-side">
+          <div class="panel">
+            <div class="chat-head">
+              <h2>本轮路由决策</h2>
+              <span class="muted">上次消息</span>
+            </div>
+            <div id="chat-decision">
+              <div class="empty">等待对话…</div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============ Settings ============ -->
+    <section id="view-settings" class="view hidden">
+      <div class="toolbar">
+        <h2>模型与提供商配置</h2>
+        <span id="cfg-status" class="muted"></span>
+      </div>
+
+      <div class="panel">
+        <h2>提供商（Provider）</h2>
+        <p class="hint">
+          真实上游 OpenAI 兼容端点与密钥。密钥留空或以 <code>***</code> 开头表示保持不变（回读时自动脱敏）。
+        </p>
+        <div id="provider-rows"></div>
+        <button id="add-provider" class="btn small ghost">+ 添加提供商</button>
+      </div>
+
+      <div class="panel">
+        <h2>模型档位（Model → Tier）</h2>
+        <p class="hint">
+          把真实模型挂到 economy / standard / premium / reasoning 档位，并配置成本与质量先验，路由据此在质量、成本、延迟、负载之间平衡。
+        </p>
+        <div id="model-rows"></div>
+        <button id="add-model" class="btn small ghost">+ 添加模型</button>
+      </div>
+
+      <div class="field-row">
+        <button id="save-config" class="btn primary">保存并热重载</button>
+        <span id="cfg-saved" class="ok hidden"></span>
+      </div>
     </section>
   </main>
 

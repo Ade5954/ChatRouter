@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any
 
+import yaml
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, ValidationError
 from starlette.background import BackgroundTask
 
-from ..config.models import TenantConfig
-from ..core.errors import ChatRouterError
+from ..config.models import ModelConfig, ProviderConfig, TenantConfig
+from ..core.errors import ChatRouterError, InvalidRequestError
 from ..core.schemas import ChatCompletionRequest, FeedbackRequest, FeedbackResponse, ModelList
 from ..observability import metrics
 from ..service import GatewayService
@@ -135,6 +138,24 @@ async def readyz(service: ServiceDep) -> Response:
     return JSONResponse(content={"status": "ready", "healthy_models": len(usable)})
 
 
+class ConfigUpdate(BaseModel):
+    """Partial configuration update: only the given sections are replaced."""
+
+    providers: list[ProviderConfig] | None = None
+    models: list[ModelConfig] | None = None
+    tenants: list[TenantConfig] | None = None
+
+
+def _redacted_config(config: Any) -> dict[str, Any]:
+    """Effective configuration with credentials redacted."""
+    data = config.model_dump(mode="json")
+    for provider in data.get("providers", []):
+        provider.pop("api_key", None)
+    for tenant in data.get("tenants", []):
+        tenant["api_keys"] = [f"***{key[-4:]}" if len(key) > 4 else "***" for key in tenant.get("api_keys", [])]
+    return data
+
+
 @admin_router.get("/status")
 async def admin_status(
     service: ServiceDep,
@@ -153,12 +174,78 @@ async def admin_config(
 ) -> dict[str, Any]:
     """Effective configuration with credentials redacted."""
     verify_admin_key(service.config, x_admin_key)
-    data = service.config.model_dump(mode="json")
-    for provider in data.get("providers", []):
-        provider.pop("api_key", None)
-    for tenant in data.get("tenants", []):
-        tenant["api_keys"] = [f"***{key[-4:]}" if len(key) > 4 else "***" for key in tenant.get("api_keys", [])]
-    return data
+    return _redacted_config(service.config)
+
+
+@admin_router.put("/config")
+async def admin_update_config(
+    payload: ConfigUpdate,
+    request: Request,
+    service: ServiceDep,
+    x_admin_key: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Persist and hot-apply a configuration update.
+
+    Only the sections present in the body are replaced (``providers``,
+    ``models``, ``tenants``). A provider ``api_key`` of ``""`` or starting
+    with ``***`` (the redacted sentinel from GET) keeps the stored value, so
+    the UI can round-trip without re-typing secrets.
+    """
+    verify_admin_key(service.config, x_admin_key)
+    config_path = getattr(request.app.state, "config_path", None)
+    if not config_path:
+        raise ChatRouterError(
+            "configuration was provided in memory; there is no file to persist to",
+            code="config_not_persistable",
+        )
+
+    raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise InvalidRequestError("configuration file root must be a mapping")
+
+    base = service.config.model_dump(mode="json")
+    raw_providers = {p.get("name"): p for p in raw.get("providers", []) if isinstance(p, dict)}
+
+    # Merge the submitted sections onto the current configuration, keeping the
+    # original (possibly ${ENV}-referencing) api_key when a placeholder comes back.
+    if payload.providers is not None:
+        merged: list[dict[str, Any]] = []
+        for provider in payload.providers:
+            pd = provider.model_dump(mode="json", exclude_none=True)
+            api_key = pd.get("api_key")
+            if not api_key or str(api_key).startswith("***"):
+                original = raw_providers.get(provider.name)
+                if original is not None and original.get("api_key"):
+                    pd["api_key"] = original["api_key"]
+                else:
+                    pd.pop("api_key", None)
+            merged.append(pd)
+        base["providers"] = merged
+        raw["providers"] = merged
+
+    if payload.models is not None:
+        models = [m.model_dump(mode="json", exclude_none=True) for m in payload.models]
+        base["models"] = models
+        raw["models"] = models
+
+    if payload.tenants is not None:
+        tenants = [t.model_dump(mode="json", exclude_none=True) for t in payload.tenants]
+        base["tenants"] = tenants
+        raw["tenants"] = tenants
+
+    try:
+        from ..config.models import AppConfig
+
+        new_config = AppConfig.model_validate(base)
+    except ValidationError as exc:
+        raise InvalidRequestError(f"invalid configuration: {exc}") from exc
+
+    Path(config_path).write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    await service.reload(new_config)
+    return _redacted_config(service.config)
 
 
 def build_metrics_route(path: str) -> APIRouter:
