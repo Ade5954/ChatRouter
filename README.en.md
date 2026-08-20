@@ -224,7 +224,7 @@ The gateway ships a zero-backend, pure-static management console (`src/chatroute
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/admin/status` | Live load, circuit breakers, quotas, learned quality |
 | GET | `/admin/config` | Effective config (credentials redacted) |
-| PUT | `/admin/config` | Update providers / models / tenants, persist to the config file and hot-reload |
+| PUT | `/admin/config` | Update providers / models / tenants, persist to Redis (shared across replicas), hot-reload, and notify all replicas via Redis Streams |
 
 ### Response Headers
 
@@ -283,6 +283,52 @@ Full configuration reference is in `config/config.example.yaml`, every field com
 - **Single replica**: `storage.backend: memory`, zero external dependencies.
 - **Multi replica**: `storage.backend: redis`. Rate-limit counters, quotas, and feedback stats are shared via Redis (counters use Lua scripts for atomicity); the gateway itself is stateless and horizontally scalable. Circuit-breaker state is deliberately kept in-process — each replica observes failures consistently, and local decisions are faster.
 
+### Externalised configuration & cross-replica hot-reload
+
+In a multi-replica deployment **configuration is no longer read only from the local file**: writes from the admin endpoint are persisted to Redis (`chatrouter:config:payload` + a monotonically increasing `chatrouter:config:version`), and every replica loads the authoritative configuration from Redis at startup. If Redis holds no configuration yet, the first replica bootstraps it from the local `config.yaml` once. The local file degrades to a bootstrap seed used only on first start.
+
+**Cross-replica config hot-reload** uses three layers of defence so no update is ever lost:
+
+| Layer | Mechanism | Defends against |
+|-------|-----------|-----------------|
+| 1 | Redis Streams persistent notifications (`XADD` + `MAXLEN ~ 100`) | Messages lost while a subscriber is offline |
+| 2 | Per-replica consumer group (`XREADGROUP` + `XACK` + `XAUTOCLAIM`) | Replica restart resumes from last-delivered; unacked messages from a crashed replica are reclaimed and replayed |
+| 3 | Service reconciles `get_config_version` every 30s | Catch-all backstop for eventual consistency |
+
+Each replica identifies itself via `CHATROUTER_REPLICA_ID` (or hostname fallback) as its consumer-group name, ensuring every replica independently consumes every notification (rather than load-balancing them across replicas). The publisher bumps its own applied version before publishing, so when it receives its own notification back the version is already stale and gets skipped — no double reload.
+
+> Circuit-breaker state is deliberately kept process-local: every replica observes large failures consistently and local decisions are faster; minor decision divergence under low traffic is harmless and buys lower breaker latency.
+
+### Multi-replica deployment (docker-compose)
+
+The repo ships `docker-compose.replicas.yml` that brings up 2 ChatRouter replicas + a shared Redis + an nginx load balancer in one command:
+
+```bash
+docker compose -f docker-compose.replicas.yml up --build
+```
+
+| Port | Purpose |
+|------|---------|
+| `http://localhost:8000` | nginx load-balanced entry (round-robin, SSE pass-through) |
+| `http://localhost:8001` | replica-1 direct (debugging) |
+| `http://localhost:8002` | replica-2 direct (debugging) |
+| `localhost:6379` | Redis (state + config + notification stream) |
+
+Verify cross-replica config hot-reload:
+
+```bash
+# Update config on replica-1
+curl -X PUT http://localhost:8001/admin/config \
+  -H 'x-admin-key: change-me' \
+  -H 'content-type: application/json' \
+  -d '{"models": [...]}'
+
+# Hit replica-2 directly and confirm it hot-reloaded via Redis Streams
+curl http://localhost:8002/v1/models -H 'Authorization: Bearer sk-chatrouter-dev'
+```
+
+Scaling out is a matter of copying the `replica-2` service block (changing the port and `CHATROUTER_REPLICA_ID`) and adding one line to the nginx upstream.
+
 ---
 
 ## Development
@@ -299,9 +345,10 @@ Test coverage: complexity analysis (including the key context-awareness assertio
 
 ## Recent Updates
 
+- **Elastic scaling (multi-replica deployment)**: configuration externalised to Redis (`chatrouter:config:payload` + monotonic version); cross-replica hot-reload uses Redis Streams + consumer groups + a 30s reconciler as three layers of defence so no notification is ever lost; ships `docker-compose.replicas.yml` (2 replicas + Redis + nginx LB) — scaling out is a copy-paste of the service block. Circuit breakers stay deliberately process-local to keep break latency low.
 - **Explainable routing console**: bundled web UI (Dashboard / Chat / Routing Decision / Settings); the Chat page explains how each turn is routed and how quality / cost / latency / load are balanced.
 - **Latency reduction**: accounting (quota / feedback / session affinity / cache write-through) moved off the response path into background tasks; complexity analysis and token estimation run off the event loop; per-model stats are fetched in parallel.
-- **Config hot-reload**: `PUT /admin/config` validates, persists to `config.yaml` and hot-reloads — provider / model / tier changes take effect immediately without a restart.
+- **Config hot-reload**: `PUT /admin/config` validates, persists to Redis and hot-reloads — provider / model / tier changes take effect immediately without a restart; in multi-replica deployments every other replica is notified via Redis Streams.
 - **Streaming failure visibility**: upstream failures are emitted in-band as SSE `error` events followed by `[DONE]` instead of a silent broken stream.
 
 ## Scope

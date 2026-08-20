@@ -77,3 +77,42 @@ def resolve_api_key(api_key: str | None, api_key_env: str | None) -> str | None:
         if from_env:
             return from_env
     return api_key
+
+
+async def load_config_from_storage(storage: Any) -> AppConfig | None:
+    """Load the authoritative configuration from a shared storage backend.
+
+    Returns ``None`` when no configuration has been persisted yet, signalling
+    the caller to bootstrap from the local file (see
+    :func:`bootstrap_config_to_storage`). The stored document is the
+    already-expanded configuration tree, so no ``${ENV}`` substitution is
+    applied here.
+    """
+    from ..storage.base import Storage
+
+    if not isinstance(storage, Storage):
+        raise ConfigError("storage must implement the Storage interface")
+
+    data = await storage.get_config()
+    if data is None:
+        return None
+    try:
+        return AppConfig.model_validate(data)
+    except Exception as exc:
+        raise ConfigError(f"invalid configuration in storage: {exc}") from exc
+
+
+async def bootstrap_config_to_storage(storage: Any, config: AppConfig) -> int:
+    """Persist a configuration into storage and return the new version.
+
+    Called once at startup when storage holds no configuration: the local
+    YAML (already expanded by :func:`load_config`) becomes the seed document
+    every replica will read from then on.
+    """
+    from ..storage.base import Storage
+
+    if not isinstance(storage, Storage):
+        raise ConfigError("storage must implement the Storage interface")
+
+    data = config.model_dump(mode="json")
+    return await storage.set_config(data)

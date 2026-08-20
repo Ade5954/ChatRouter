@@ -1,6 +1,13 @@
 """Configuration package."""
 
-from .loader import ConfigError, load_config, resolve_api_key, resolve_config_path
+from .loader import (
+    ConfigError,
+    bootstrap_config_to_storage,
+    load_config,
+    load_config_from_storage,
+    resolve_api_key,
+    resolve_config_path,
+)
 from .models import (
     TIERS_ASCENDING,
     AppConfig,
@@ -46,7 +53,9 @@ __all__ = [
     "StorageConfig",
     "TenantConfig",
     "TierThresholds",
+    "bootstrap_config_to_storage",
     "load_config",
+    "load_config_from_storage",
     "resolve_api_key",
     "resolve_config_path",
 ]

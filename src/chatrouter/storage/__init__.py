@@ -18,5 +18,5 @@ __all__ = [
 def build_storage(config: StorageConfig) -> Storage:
     """Instantiate the configured storage backend."""
     if config.backend == "redis":
-        return RedisStorage(config.redis_url, config.key_prefix)
+        return RedisStorage(config.redis_url, config.key_prefix, replica_id=config.replica_id)
     return MemoryStorage(config.key_prefix)

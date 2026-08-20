@@ -7,6 +7,7 @@ lost on restart and is *not* shared between workers.
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import time
 from collections.abc import Callable
 from typing import Any
@@ -36,6 +37,13 @@ class MemoryStorage(Storage):
         self._gauges: dict[str, int] = {}
         self._stats: dict[str, _Bucket] = {}
         self._records: dict[str, _Bucket] = {}
+        # Externalised configuration: not swept, lives until overwritten.
+        self._config_doc: dict[str, Any] | None = None
+        self._config_version: int = 0
+        # In-process pub/sub: one queue per active subscriber. publish() fans
+        # out by putting the version into every queue. The single-event-loop
+        # contract makes this safe without extra locking.
+        self._config_subscribers: list[asyncio.Queue[int]] = []
         self._lock = asyncio.Lock()
         self._last_sweep = 0.0
 
@@ -229,3 +237,61 @@ class MemoryStorage(Storage):
             {"model": model_id, "prefix_tokens": int(prefix_tokens)},
             time.time() + ttl_seconds,
         )
+
+    # -- externalised configuration -------------------------------------
+
+    async def get_config(self) -> dict[str, Any] | None:
+        # Return a shallow copy so callers cannot mutate the stored document
+        # in place; nested structures are shared, which is fine because the
+        # service rebuilds AppConfig from model_validate, not by mutation.
+        return dict(self._config_doc) if self._config_doc is not None else None
+
+    async def set_config(self, data: dict[str, Any]) -> int:
+        async with self._lock:
+            self._config_doc = dict(data)
+            self._config_version += 1
+            return self._config_version
+
+    async def get_config_version(self) -> int:
+        return self._config_version
+
+    # -- cross-replica reload notifications ------------------------------
+
+    async def publish_config_reload(self, version: int) -> None:
+        # Fan out to every subscriber's queue. A subscriber that has fallen
+        # behind (queue full) would block publish; we bound the queue so a
+        # slow consumer drops intermediate notifications rather than blocking
+        # the writer — it will reload from the latest version it sees.
+        for queue in self._config_subscribers:
+            try:
+                queue.put_nowait(version)
+            except asyncio.QueueFull:
+                # Drop the oldest pending notification; the new version
+                # supersedes it anyway. The subscriber reloads from storage
+                # so it always reads the freshest payload.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                queue.put_nowait(version)
+
+    def config_reload_events(self) -> collections.abc.AsyncIterator[int]:
+        # Register the subscriber synchronously, *before* the generator starts
+        # producing, so a publish() that happens immediately after start()
+        # cannot miss this subscriber. The generator itself only consumes; it
+        # never touches the subscriber list until it is torn down.
+        queue: asyncio.Queue[int] = asyncio.Queue(maxsize=64)
+        self._config_subscribers.append(queue)
+        return self._consume_config_reload(queue)
+
+    async def _consume_config_reload(
+        self, queue: asyncio.Queue[int]
+    ) -> collections.abc.AsyncIterator[int]:
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            try:
+                self._config_subscribers.remove(queue)
+            except ValueError:
+                pass

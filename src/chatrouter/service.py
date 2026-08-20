@@ -91,20 +91,66 @@ class GatewayService:
         self.response_cache = ResponseCache(config.routing.response_cache, self.storage)
         # Provider pools replaced by :meth:`reload`; closed on shutdown.
         self._retired_pools: list[ProviderPool] = []
+        # Configuration version this replica has applied. The subscription
+        # task compares incoming notifications against this value and skips
+        # reloads for versions it has already seen (including the one it just
+        # published itself — see ``apply_config_update``).
+        self._applied_config_version: int = 0
+        self._reload_watcher_task: asyncio.Task[None] | None = None
+        # Belt-and-suspenders: even if the notification stream loses a message
+        # (a bug, a Redis flush, an XAUTOCLAIM edge case), this periodic poll
+        # of the canonical version catches up within the interval. It is the
+        # last line of defence for eventual consistency.
+        self._reconciler_task: asyncio.Task[None] | None = None
+        self._reconcile_interval_seconds: float = 30.0
 
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
         await self.storage.start()
+        # Record the version of the configuration we are starting with so the
+        # subscription task ignores the reload notification this replica may
+        # publish for itself later (and any stale notification that arrives
+        # during startup).
+        self._applied_config_version = await self.storage.get_config_version()
+        # Signal from the watcher task once it has registered its
+        # subscription. We wait for it before returning so a publish() that
+        # happens immediately after start() — e.g. another replica applying
+        # a config update in the same event loop tick — cannot race past
+        # the subscriber and be lost.
+        self._watcher_subscribed = asyncio.Event()
+        self._reload_watcher_task = asyncio.get_running_loop().create_task(
+            self._watch_config_reloads()
+        )
+        await self._watcher_subscribed.wait()
+        # Start the reconciler after the watcher is live so the two never
+        # race: the watcher handles the common path, the reconciler only
+        # fires when it detects drift.
+        self._reconciler_task = asyncio.get_running_loop().create_task(
+            self._reconcile_config_version()
+        )
         logger.info(
             "gateway started",
             models=len(self.router.models),
             providers=len(self.config.providers),
             tenants=len(self.config.tenants),
             storage=self.config.storage.backend,
+            config_version=self._applied_config_version,
         )
 
     async def close(self) -> None:
+        # Cancel the watcher and reconciler first so neither can observe a
+        # half-shutdown service (storage closed, providers gone) and try to
+        # reload.
+        for task in (self._reload_watcher_task, self._reconciler_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._reload_watcher_task = None
+        self._reconciler_task = None
         await self.providers.close()
         for pool in self._retired_pools:
             await pool.close()
@@ -147,6 +193,127 @@ class GatewayService:
             providers=len(new_config.providers),
             tenants=len(new_config.tenants),
         )
+
+    async def reload_from_storage(self) -> bool:
+        """Pull the authoritative configuration from storage and reload.
+
+        Returns ``True`` if a configuration was found and applied, ``False``
+        when storage holds no configuration (so callers can skip silently).
+        Used by the cross-replica reload subscription (Phase 2) and by the
+        admin endpoint after it persists an update.
+        """
+        from .config.loader import load_config_from_storage
+
+        new_config = await load_config_from_storage(self.storage)
+        if new_config is None:
+            return False
+        await self.reload(new_config)
+        self._applied_config_version = await self.storage.get_config_version()
+        return True
+
+    async def apply_config_update(self, config_dict: dict[str, Any]) -> AppConfig:
+        """Persist, apply, and announce a configuration update.
+
+        This is the single entry point for admin-driven changes: it writes the
+        new document to the shared store, hot-applies it to *this* replica,
+        and publishes a reload notification so every other replica converges
+        on the same configuration. Callers should validate ``config_dict``
+        into an ``AppConfig`` first (and surface validation errors to the
+        client) before calling this — but we re-validate here as a defence
+        in depth so the store can never hold an invalid document.
+        """
+        from .config.models import AppConfig
+
+        new_config = AppConfig.model_validate(config_dict)
+        await self.storage.set_config(config_dict)
+        await self.reload(new_config)
+        # Bump our own applied version *before* publishing: the pub/sub
+        # message will be delivered back to this same replica (Redis fans
+        # out to every subscriber, including the publisher), and the watcher
+        # must treat it as already-applied rather than re-reloading.
+        self._applied_config_version = await self.storage.get_config_version()
+        await self.storage.publish_config_reload(self._applied_config_version)
+        return new_config
+
+    async def _watch_config_reloads(self) -> None:
+        """Background task: react to cross-replica config reload notifications.
+
+        Subscribes to the storage's reload channel and pulls the fresh
+        configuration from storage whenever a newer version arrives. The
+        task runs for the lifetime of the service and is cancelled on
+        shutdown. Errors are logged and swallowed so a transient storage
+        hiccup cannot kill the subscription permanently.
+        """
+        try:
+            # Establish the subscription first and signal readiness before
+            # entering the consume loop: start() awaits this signal so a
+            # publish() in the same tick cannot race past the subscriber.
+            events = self.storage.config_reload_events()
+            self._watcher_subscribed.set()
+            async for version in events:
+                if version <= self._applied_config_version:
+                    # Stale or self-published notification: we have already
+                    # applied this version (or a newer one) via the local
+                    # reload path. Skipping avoids a redundant rebuild and
+                    # the double-close of the provider pool that a second
+                    # reload would trigger.
+                    continue
+                try:
+                    applied = await self.reload_from_storage()
+                    if not applied:
+                        logger.warning(
+                            "config reload notification received but storage holds no config",
+                            version=version,
+                        )
+                    else:
+                        logger.info(
+                            "config reloaded from cross-replica notification",
+                            version=version,
+                        )
+                except Exception:
+                    # The reload failed; leave the previous configuration
+                    # in place and keep listening. The next notification (or
+                    # the next admin write) will retry.
+                    logger.exception(
+                        "config reload from storage failed", version=version
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The subscription itself crashed (storage connection lost, etc.).
+            # Without it this replica will keep serving with its last-known
+            # configuration until restarted; the next admin write will
+            # republish and any live replicas will catch up.
+            logger.exception("config reload subscription crashed")
+
+    async def _reconcile_config_version(self) -> None:
+        """Periodically check the canonical config version against our own.
+
+        This is the belt-and-suspenders backstop for the notification stream:
+        if a notification is lost for any reason (stream eviction by MAXLEN,
+        an XAUTOCLAIM edge case, a bug), this poll catches the version drift
+        within ``_reconcile_interval_seconds`` and reloads from storage. It is
+        strictly a safety net — the notification stream is the primary path
+        and reacts in milliseconds, while this runs every 30s.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._reconcile_interval_seconds)
+                try:
+                    current = await self.storage.get_config_version()
+                    if current > self._applied_config_version:
+                        logger.warning(
+                            "config version drift detected by reconciler",
+                            applied=self._applied_config_version,
+                            storage=current,
+                        )
+                        await self.reload_from_storage()
+                except Exception:
+                    # Storage may be temporarily unreachable; keep the
+                    # reconciler alive so it retries on the next tick.
+                    logger.exception("config reconciliation check failed")
+        except asyncio.CancelledError:
+            raise
 
     async def _close_old_providers(self, pool: ProviderPool, grace_seconds: float = 60.0) -> None:
         """Close a replaced provider pool after in-flight requests drain."""

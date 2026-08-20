@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Annotated, Any
 
-import yaml
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ValidationError
@@ -184,67 +182,48 @@ async def admin_update_config(
     service: ServiceDep,
     x_admin_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
-    """Persist and hot-apply a configuration update.
+    """Persist, hot-apply and announce a configuration update.
 
     Only the sections present in the body are replaced (``providers``,
     ``models``, ``tenants``). A provider ``api_key`` of ``""`` or starting
-    with ``***`` (the redacted sentinel from GET) keeps the stored value, so
-    the UI can round-trip without re-typing secrets.
+    with ``***`` (the redacted sentinel from GET) keeps the currently
+    effective value, so the UI can round-trip without re-typing secrets.
+
+    The merged document is written to the shared storage backend, hot-applied
+    to this replica, and published via Pub/Sub so every other replica
+    reloads from the same source of truth within milliseconds.
     """
     verify_admin_key(service.config, x_admin_key)
-    config_path = getattr(request.app.state, "config_path", None)
-    if not config_path:
-        raise ChatRouterError(
-            "configuration was provided in memory; there is no file to persist to",
-            code="config_not_persistable",
-        )
 
-    raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-    if not isinstance(raw, dict):
-        raise InvalidRequestError("configuration file root must be a mapping")
-
+    # The effective configuration in memory is the source of truth for
+    # preserving secrets across a round-trip from the redacted GET payload.
     base = service.config.model_dump(mode="json")
-    raw_providers = {p.get("name"): p for p in raw.get("providers", []) if isinstance(p, dict)}
+    current_providers = {p.get("name"): p for p in base.get("providers", []) if isinstance(p, dict)}
 
-    # Merge the submitted sections onto the current configuration, keeping the
-    # original (possibly ${ENV}-referencing) api_key when a placeholder comes back.
     if payload.providers is not None:
         merged: list[dict[str, Any]] = []
         for provider in payload.providers:
             pd = provider.model_dump(mode="json", exclude_none=True)
             api_key = pd.get("api_key")
             if not api_key or str(api_key).startswith("***"):
-                original = raw_providers.get(provider.name)
-                if original is not None and original.get("api_key"):
-                    pd["api_key"] = original["api_key"]
+                current = current_providers.get(provider.name)
+                if current is not None and current.get("api_key"):
+                    pd["api_key"] = current["api_key"]
                 else:
                     pd.pop("api_key", None)
             merged.append(pd)
         base["providers"] = merged
-        raw["providers"] = merged
 
     if payload.models is not None:
-        models = [m.model_dump(mode="json", exclude_none=True) for m in payload.models]
-        base["models"] = models
-        raw["models"] = models
+        base["models"] = [m.model_dump(mode="json", exclude_none=True) for m in payload.models]
 
     if payload.tenants is not None:
-        tenants = [t.model_dump(mode="json", exclude_none=True) for t in payload.tenants]
-        base["tenants"] = tenants
-        raw["tenants"] = tenants
+        base["tenants"] = [t.model_dump(mode="json", exclude_none=True) for t in payload.tenants]
 
     try:
-        from ..config.models import AppConfig
-
-        new_config = AppConfig.model_validate(base)
+        await service.apply_config_update(base)
     except ValidationError as exc:
         raise InvalidRequestError(f"invalid configuration: {exc}") from exc
-
-    Path(config_path).write_text(
-        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
-    await service.reload(new_config)
     return _redacted_config(service.config)
 
 

@@ -460,6 +460,16 @@ class StorageConfig(BaseModel):
     backend: Literal["memory", "redis"] = "memory"
     redis_url: str = "redis://localhost:6379/0"
     key_prefix: str = "chatrouter"
+    # Stable identity of this replica in a multi-replica deployment. Used as
+    # the Redis Streams consumer group name so each replica independently
+    # consumes every config-reload notification (rather than the messages
+    # being load-balanced across replicas). When unset the storage backend
+    # falls back to the CHATROUTER_REPLICA_ID env var, then hostname, then
+    # "default" — the fallbacks are fine for single-instance deployments but
+    # a multi-replica deployment MUST set this (or rely on distinct hostnames,
+    # as docker-compose gives each container) so two replicas never share a
+    # consumer group and silently steal each other's notifications.
+    replica_id: str | None = None
 
 
 class ObservabilityConfig(BaseModel):

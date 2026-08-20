@@ -8,6 +8,7 @@ Both share this interface so the rest of the gateway is backend agnostic.
 from __future__ import annotations
 
 import abc
+import collections.abc
 from dataclasses import dataclass
 from typing import Any
 
@@ -157,3 +158,55 @@ class Storage(abc.ABC):
         """
         binding = await self.get_session_affinity(session_id)
         return binding.ttl_remaining if binding is not None else 0
+
+    # -- Externalised configuration (multi-replica) ----------------------
+
+    async def get_config(self) -> dict[str, Any] | None:
+        """Read the authoritative configuration document, or ``None`` if unset.
+
+        Used at startup to load the gateway's configuration from a shared
+        store so every replica converges on the same providers, models,
+        tenants and routing policy. The document is the already-expanded
+        configuration tree (no ``${ENV}`` placeholders); callers pass it
+        straight to ``AppConfig.model_validate``.
+        """
+        raise NotImplementedError
+
+    async def set_config(self, data: dict[str, Any]) -> int:
+        """Persist the authoritative configuration and return the new version.
+
+        Every write bumps a monotonic version number so subscribers can decide
+        whether a reload notification carries a configuration they have
+        already applied (Phase 2 will publish that version via Pub/Sub).
+        """
+        raise NotImplementedError
+
+    async def get_config_version(self) -> int:
+        """Current configuration version, or 0 when no configuration is stored."""
+        raise NotImplementedError
+
+    # -- Cross-replica reload notifications (Phase 2) --------------------
+
+    async def publish_config_reload(self, version: int) -> None:
+        """Notify every replica that a new configuration version is available.
+
+        The message body is just the version number; subscribers pull the
+        payload from :meth:`get_config` themselves. This keeps the publish
+        cheap and avoids serialising a large document twice (it is already
+        stored via :meth:`set_config`).
+        """
+        raise NotImplementedError
+
+    def config_reload_events(self) -> "collections.abc.AsyncIterator[int]":
+        """Return an async iterator yielding configuration version numbers.
+
+        Each yielded value is the version announced by a publisher (i.e. a
+        replica that just wrote a new configuration). Subscribers compare it
+        against the version they have already applied and reload from storage
+        only when the announcement is newer.
+
+        The iterator runs forever; cancelling the task consuming it
+        unsubscribes. Backends without a real pub/sub mechanism (the in-memory
+        backend used by tests) implement this with an ``asyncio.Queue``.
+        """
+        raise NotImplementedError

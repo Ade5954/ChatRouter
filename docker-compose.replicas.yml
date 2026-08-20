@@ -1,0 +1,127 @@
+# Multi-replica deployment for elastic-scaling tests.
+#
+# Brings up:
+#   - 2 ChatRouter replicas (replica-1, replica-2) sharing one Redis
+#   - 1 Redis (state + config store + reload notifications via Streams)
+#   - 1 nginx load balancer fronting the replicas on http://localhost:8000
+#
+# The first replica to start bootstraps the shared configuration into Redis
+# from the local config/config.yaml; every subsequent replica (including
+# additional ones you add by copying the replica-2 block) loads the
+# authoritative configuration from Redis. Admin PUT /admin/config on any
+# replica is published via Redis Streams and hot-applied on every other
+# replica within milliseconds.
+#
+# Usage:
+#   docker compose -f docker-compose.replicas.yml up --build
+#   # Gateway:      http://localhost:8000  (load-balanced)
+#   # Replica-1:    http://localhost:8001  (direct, for debugging)
+#   # Replica-2:    http://localhost:8002  (direct, for debugging)
+#   # Redis:        localhost:6379
+#
+# Verify cross-replica config reload:
+#   curl -X PUT http://localhost:8001/admin/config -H 'x-admin-key: change-me' \
+#        -H 'content-type: application/json' -d '{"models": [...]}'
+#   # Then hit replica-2 directly and confirm it sees the new models:
+#   curl http://localhost:8002/v1/models -H 'Authorization: Bearer sk-chatrouter-dev'
+
+services:
+  replica-1:
+    build: .
+    image: chatrouter:replicas
+    container_name: chatrouter-replica-1
+    environment:
+      CHATROUTER_STORAGE: redis
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: INFO
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8001/v1}
+      CHATROUTER_ADMIN_KEY: ${CHATROUTER_ADMIN_KEY:-change-me}
+      CHATROUTER_DEFAULT_KEY: ${CHATROUTER_DEFAULT_KEY:-sk-chatrouter-dev}
+      # Explicit replica identity for the Redis Streams consumer group.
+      # Each replica MUST have a distinct value so its consumer group is
+      # independent (otherwise two replicas would steal each other's
+      # notifications). Hostname fallback also works in docker-compose, but
+      # setting it explicitly makes the intent obvious in logs.
+      CHATROUTER_REPLICA_ID: replica-1
+    ports:
+      - "8001:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  replica-2:
+    # Reuses the image built for replica-1 so a multi-replica `up --build`
+    # only builds once.
+    image: chatrouter:replicas
+    container_name: chatrouter-replica-2
+    environment:
+      CHATROUTER_STORAGE: redis
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: INFO
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://host.docker.internal:8001/v1}
+      CHATROUTER_ADMIN_KEY: ${CHATROUTER_ADMIN_KEY:-change-me}
+      CHATROUTER_DEFAULT_KEY: ${CHATROUTER_DEFAULT_KEY:-sk-chatrouter-dev}
+      CHATROUTER_REPLICA_ID: replica-2
+    ports:
+      - "8002:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      replica-1:
+        # Wait for replica-1 to finish bootstrapping the configuration into
+        # Redis so replica-2 starts with the authoritative document instead
+        # of racing to bootstrap its own copy. Once the config is in Redis
+        # the order no longer matters, but this avoids a startup race where
+        # both replicas would otherwise try to seed the store concurrently.
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  nginx:
+    image: nginx:alpine
+    container_name: chatrouter-nginx
+    volumes:
+      - ./deploy/nginx/replicas.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      replica-1:
+        condition: service_healthy
+      replica-2:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:

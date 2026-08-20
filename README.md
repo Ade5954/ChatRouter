@@ -225,7 +225,7 @@ curl -X POST http://localhost:8000/v1/routing/explain \
 | GET | `/metrics` | Prometheus 指标 |
 | GET | `/admin/status` | 实时负载、熔断、配额、学习到的质量 |
 | GET | `/admin/config` | 生效配置（凭据已脱敏） |
-| PUT | `/admin/config` | 更新 provider / 模型 / 租户并写回配置文件、热重载即时生效 |
+| PUT | `/admin/config` | 更新 provider / 模型 / 租户，持久化到 Redis（多副本共享）、热重载并通过 Redis Streams 通知所有副本 |
 
 ### 响应头
 
@@ -284,6 +284,52 @@ utility = 质量偏好 × 反馈修正质量
 - **单副本**：`storage.backend: memory`，零外部依赖。
 - **多副本**：`storage.backend: redis`。限流计数、配额与反馈统计经 Redis 共享（计数器使用 Lua 脚本保证原子性），网关本身无状态，可水平扩展。熔断器状态刻意保持进程内——每个副本对故障的观测本就一致，本地决策更快。
 
+### 配置外部化与跨副本热重载
+
+多副本下，**配置不再只读本地文件**：admin 写入的配置会持久化到 Redis（`chatrouter:config:payload` + 单调递增的 `chatrouter:config:version`），每个副本启动时从 Redis 加载权威配置；若 Redis 无配置，则由首个副本把本地 `config.yaml` 引导导入一次。本地 `config.yaml` 退化为 bootstrap 文件，仅供首次启动使用。
+
+**跨副本配置热重载**采用三层防御确保更新不丢失：
+
+| 层 | 机制 | 防御场景 |
+|----|------|----------|
+| 1 | Redis Streams 持久化通知（`XADD` + `MAXLEN ~ 100`） | 订阅者离线期间消息不丢 |
+| 2 | 每副本独立 consumer group（`XREADGROUP` + `XACK` + `XAUTOCLAIM`） | 副本重启从断点续读；崩溃未 ACK 的消息被抢回重放 |
+| 3 | service 每 30s 对账 `get_config_version` | 任何边角场景的最终一致兜底 |
+
+每副本通过 `CHATROUTER_REPLICA_ID`（或 hostname fallback）标识自己，作为 consumer group 名称，确保每个副本独立消费每条通知（而非负载均衡分摊）。发布者写完后先 bump 本地 applied version 再 publish，收到自己发出的通知时版本号已过期，自动跳过，避免重复 reload。
+
+> 熔断器状态刻意保持进程本地：每个副本对大故障的观测本就一致，本地决策更快；小流量下的轻微决策分叉不影响正确性，且换取了更低的熔断响应延迟。
+
+### 多副本部署（docker-compose）
+
+仓库提供 `docker-compose.replicas.yml`，一键拉起 2 个 ChatRouter 副本 + 共享 Redis + nginx 负载均衡：
+
+```bash
+docker compose -f docker-compose.replicas.yml up --build
+```
+
+| 端口 | 用途 |
+|------|------|
+| `http://localhost:8000` | nginx 负载均衡入口（轮询两副本，SSE 流式透传） |
+| `http://localhost:8001` | replica-1 直连（调试用） |
+| `http://localhost:8002` | replica-2 直连（调试用） |
+| `localhost:6379` | Redis（状态 + 配置 + 通知 Stream） |
+
+验证跨副本配置热重载：
+
+```bash
+# 在 replica-1 修改配置
+curl -X PUT http://localhost:8001/admin/config \
+  -H 'x-admin-key: change-me' \
+  -H 'content-type: application/json' \
+  -d '{"models": [...]}'
+
+# 直接访问 replica-2，确认它已通过 Redis Streams 收到通知并热重载
+curl http://localhost:8002/v1/models -H 'Authorization: Bearer sk-chatrouter-dev'
+```
+
+扩容只需复制 `replica-2` 服务块并改端口与 `CHATROUTER_REPLICA_ID`，nginx upstream 加一行即可。
+
 ---
 
 ## 开发
@@ -300,9 +346,10 @@ ruff check src tests
 
 ## 近期更新
 
+- **弹性扩容（多副本部署）**：配置外部化到 Redis（`chatrouter:config:payload` + 单调版本号）；跨副本热重载用 Redis Streams + consumer group + 定期对账三层机制确保通知不丢；新增 `docker-compose.replicas.yml`（2 副本 + Redis + nginx 负载均衡），扩容只需复制服务块。熔断器刻意保持进程本地以换取更低响应延迟。
 - **可解释路由控制台**：内置 Web 管理界面（Dashboard / 对话 / 路由决策 / 设置），对话页每轮实时解释路由如何分配、如何在质量 / 成本 / 延迟 / 负载之间平衡。
 - **低时延改造**：记账（配额 / 反馈 / 会话亲和 / 缓存写穿）全部异步化到响应提交之后；复杂度分析与 token 估算移出事件循环；逐模型统计改为并行读取。
-- **配置热重载**：`PUT /admin/config` 校验合并后写回 `config.yaml` 并热重载，provider / 模型 / 档位调整即时生效，无需重启进程。
+- **配置热重载**：`PUT /admin/config` 校验合并后持久化到 Redis 并热重载，provider / 模型 / 档位调整即时生效，无需重启进程；多副本下通过 Redis Streams 通知所有副本。
 - **流式失败可见性**：上游失败以 SSE `error` 事件随流返回并以 `[DONE]` 收尾，客户端不再面对静默断流。
 
 ## 范围说明
