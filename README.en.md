@@ -361,4 +361,4 @@ This project focuses on backend LLM traffic governance and ships a lightweight w
 
 ## License
 
-MIT
+Apache 2.0
